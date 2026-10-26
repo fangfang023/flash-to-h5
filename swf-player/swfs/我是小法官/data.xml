@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<data name="我是小法官" x="260" y="5"> 
+    
+   <top txt="1.如果两个圆的半径相等，那么这两个圆的周长也一定相等。(  )" answer="right">    </top> 
+   <top txt="2.车轮滚动一周所行的路程就是这个车轮的周长。(  )" answer="right">    </top> 
+   <top txt="3.大圆周长与直径的比值等于小圆周长与直径的比值。(  )" answer="right">    </top> 
+   <top txt="4.一个圆的半径扩大到原来的3倍，它的周长扩大到原来的6倍。(  )" answer="wrong">    </top> 
+   <top txt="5.周长相等的两个圆，半径也一定相等。(  )" answer="right">    </top> 
+ 
+</data>

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>姹 · 汉字学习卡</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
+         background:linear-gradient(180deg,#dff1ff,#f6fcff);
+         min-height:100vh; display:flex; flex-direction:column;
+         align-items:center; justify-content:center; }
+  .card { position:relative; width:min(96vw,720px); user-select:none; }
+  .card img.bg { display:block; width:100%; }
+  /* 装饰动画层: 还原原SWF子精灵循环动画(云/荷花/荷叶/水车/田字格摇摆) */
+  .anim {
+    position: absolute;
+    background-repeat: no-repeat;
+    pointer-events: none;
+    animation: play linear infinite;
+  }
+  .panel { position:absolute; left:5.83%;top:0.35%;width:90.14%; pointer-events:none; }
+  .panel img { width:100%; display:block; }
+  .hot { position:absolute; cursor:pointer; border-radius:50%; transition:transform .12s, filter .12s; }
+  .hot:hover { transform:scale(1.07); filter:brightness(1.12); }
+  .hot.active { filter:brightness(1.2) drop-shadow(0 0 8px rgba(255,170,60,.9)); }
+  .btnbar { display:flex; gap:10px; padding-bottom:10px; }
+  .btnbar button { padding:8px 18px; border-radius:18px; border:2px solid #ffd9b0;
+                   background:#fff7ef; color:#d97a1f; font-size:15px; cursor:pointer; }
+  .hint { color:#5b8fb5; font-size:14px; padding:14px 0 20px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="card">
+  <img class="bg" src="bg.png" alt="">
+  <div class="panel" id="panel"><img id="panelImg" src="" alt=""></div>
+  <div class="hot" data-panel="panel_pinyin.png" style="left:23.8%;top:24.6%;width:14%;height:13%" title="pinyin"></div>
+  <div class="hot" data-panel="panel_bushou.png" style="left:73.4%;top:26.5%;width:14%;height:13%" title="bushou"></div>
+  <div class="hot" data-panel="panel_jiegou.png" style="left:21.1%;top:50.2%;width:14%;height:13%" title="jiegou"></div>
+  <div class="hot" data-panel="panel_ziyi.png" style="left:73.8%;top:46.4%;width:14%;height:13%" title="ziyi"></div>
+  <div class="hot" data-panel="panel_cixing.png" style="left:12.6%;top:70.5%;width:14%;height:13%" title="cixing"></div>
+  <div class="hot" data-panel="panel_zuci.png" style="left:82.0%;top:69.7%;width:14%;height:13%" title="zuci"></div>
+  <div id="animLayer"></div>
+</div>
+<div class="btnbar">
+  <button id="replay">↻ 重播讲解</button>
+  <button id="reset">清空面板</button>
+</div>
+<div class="hint">点击画面中的按钮查看对应内容</div>
+<audio id="narr" src="narrate.mp3" preload="auto"></audio>
+<script>
+const narr = document.getElementById('narr');
+const panelImg = document.getElementById('panelImg');
+const hots = document.querySelectorAll('.hot');
+panelImg.parentElement.style.display = 'none';
+hots.forEach(h => h.addEventListener('click', () => {
+  hots.forEach(x => x.classList.remove('active'));
+  h.classList.add('active');
+  panelImg.src = h.dataset.panel;
+  panelImg.parentElement.style.display = 'block';
+}));
+document.getElementById('replay').onclick = () => { narr.currentTime = 0; narr.play(); };
+document.getElementById('reset').onclick = () => {
+  hots.forEach(x => x.classList.remove('active'));
+  panelImg.parentElement.style.display = 'none';
+};
+// ===== 装饰动画层(还原原SWF子精灵循环动画) =====
+const ANIMS = [{"img": "anim_71.png", "n": 50, "x": 42, "y": 2, "w": 661, "h": 298, "dur": 4.2}, {"img": "anim_11.png", "n": 120, "x": 176, "y": 429, "w": 59, "h": 72, "dur": 6, "flip": false}, {"img": "anim_11.png", "n": 120, "x": 423, "y": 411, "w": 65, "h": 78, "dur": 6, "flip": false}, {"img": "anim_13.png", "n": 120, "x": 406, "y": 388, "w": 33, "h": 128, "dur": 6, "flip": false}, {"img": "anim_17.png", "n": 120, "x": 165, "y": 455, "w": 107, "h": 99, "dur": 6, "flip": false}, {"img": "anim_15.png", "n": 120, "x": 222, "y": 452, "w": 87, "h": 46, "dur": 6, "flip": false}, {"img": "anim_15.png", "n": 120, "x": 366, "y": 465, "w": 122, "h": 65, "dur": 6, "flip": true}, {"img": "anim_30.png", "n": 9, "x": 356, "y": 383, "w": 76, "h": 72, "dur": 0.9, "flip": false}];
+const layer = document.getElementById('animLayer');
+ANIMS.forEach(a => {
+  const d = document.createElement('div');
+  d.className = 'anim';
+  d.style.left = (a.x / 720 * 100) + '%';
+  d.style.top = (a.y / 576 * 100) + '%';
+  d.style.width = (a.w / 720 * 100) + '%';
+  d.style.height = (a.h / 576 * 100) + '%';
+  d.style.backgroundImage = `url(anim/${a.img})`;
+  d.style.backgroundSize = `${a.n * 100}% 100%`;
+  d.style.animationDuration = a.dur + 's';
+  if (a.flip) d.style.transform = 'scaleX(-1)';
+  const stepPct = 100 / a.n;
+  const key = document.createElement('style');
+  const kname = 'play' + a.img.replace('.', '_');
+  // steps帧动画: bg-position 百分比语义为 (容器宽-图宽)×p, 0%→100% 恰好滑过整张sheet
+  key.textContent = `@keyframes ${kname} { from { background-position: 0% 0; } to { background-position: 100% 0; } }`;
+  document.head.appendChild(key);
+  d.style.animationName = kname;
+  d.style.animationTimingFunction = `steps(${a.n - 1}, end)`;
+  layer.appendChild(d);
+});
+
+// ===== 按钮点击音效(原SWF具名音效38.mp3) =====
+const clickSnd = new Audio('click.mp3');
+document.querySelectorAll('.hot').forEach(h => {
+  h.addEventListener('pointerdown', () => { clickSnd.currentTime = 0; clickSnd.play().catch(()=>{}); });
+});
+
+if (narr) narr.play().catch(() => {});
+const idx = ['pinyin','bushou','jiegou','ziyi','cixing','zuci'].indexOf(location.hash.slice(1));
+if (idx >= 0 && hots[idx]) hots[idx].click();
+</script>
+</body>
+</html>

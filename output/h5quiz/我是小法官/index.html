@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>我是小法官</title>
+<style>
+  /* 布局还原自 SWF 720x576 舞台: 标题(y5) 滚动区(y~44..530) 底部三按钮 */
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: "PingFang SC","Microsoft YaHei",sans-serif;
+    background:#fff; display:flex; justify-content:center;
+    min-height:100vh; padding:10px 0;
+  }
+  .stage {
+    position:relative; width:min(96vw,720px); aspect-ratio:720/576;
+    background:#fff;
+  }
+  .header {
+    position:absolute; top:1%; left:0; right:0; text-align:center;
+    font-size:26px; font-weight:600; color:#111;
+  }
+  /* 滚动面板: bg.png 的绿色圆角框区域 ≈ (26,44)-(676,530) */
+  .panel {
+    position:absolute; left:3.6%; top:7.6%; width:90.5%; height:84.5%;
+    background:#fbfbe8; border:2px solid #a8c86a; border-radius:10px;
+    overflow-y:auto; overflow-x:hidden;
+  }
+  .content { padding:18px 26px 18px 18px; }
+  /* 题图区 */
+  .picwrap { text-align:center; margin-bottom:8px; }
+  .picwrap img { max-width:88%; max-height:260px; }
+  /* 每道题 */
+  .q { border-bottom:1px dashed #d8dfa8; padding:14px 4px 16px; }
+  .q:last-child { border-bottom:none; }
+  .qtext { font-size:17px; line-height:1.7; color:#222; }
+  .qops { margin-top:10px; display:flex; align-items:center; gap:12px; min-height:34px; }
+  .btn-please {
+    height:26px; cursor:pointer; border:none; background:transparent; padding:0;
+    display:inline-block;
+  }
+  .btn-please img { height:26px; display:block; }
+  .btn-please:hover img { content:url("img/please_over.png"); }
+  .judge-mark { width:22px; height:22px; vertical-align:middle; }
+  .choice { display:none; gap:12px; align-items:center; }
+  .choice.show { display:flex; }
+  .choice button {
+    background:transparent; border:none; cursor:pointer; padding:2px;
+  }
+  .choice button img { width:26px; height:20px; display:block; }
+  .choice button:hover { transform:scale(1.15); }
+  .chosen { display:none; }
+  .chosen img { width:26px; }
+  .verdict { display:none; margin-left:8px; }
+  .verdict img { height:24px; vertical-align:middle; }
+  .result-mark { display:none; margin-left:8px; }
+  .result-mark img { height:22px; vertical-align:middle; }
+  /* 底部按钮 */
+  .footer {
+    position:absolute; bottom:1.4%; left:0; right:0;
+    display:flex; justify-content:center; gap:18px;
+  }
+  .footer button {
+    height:26px; border:none; background:transparent; cursor:pointer; padding:0;
+    display:none;
+  }
+  .footer button img { height:26px; display:block; }
+  .footer button:hover img { filter:brightness(1.12); }
+  .footer button.always { display:inline-block; }
+  /* 结算横幅 */
+  .score {
+    display:none; position:absolute; left:50%; top:44%; transform:translate(-50%,-50%);
+    background:rgba(255,255,255,.97); border:3px solid #a8c86a; border-radius:14px;
+    padding:22px 44px; text-align:center; z-index:9;
+    box-shadow:0 8px 30px rgba(80,120,40,.25);
+  }
+  .score .big { font-size:44px; font-weight:700; color:#5a9a1e; }
+  .score .tip { color:#666; margin-top:6px; font-size:15px; }
+  .score button {
+    margin-top:14px; padding:8px 26px; border-radius:16px; border:none;
+    background:#8cb84e; color:#fff; font-size:16px; cursor:pointer;
+  }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="header" id="header"></div>
+  <div class="panel" id="panel">
+    <div class="content">
+      <div class="picwrap"><img id="qpic" src="" alt=""></div>
+      <div id="qlist"></div>
+    </div>
+  </div>
+  <div class="footer">
+    <button id="btnReset" class="always">↻ 重新开始</button>
+    <button id="btnSubmit" class="always"><img src="img/btn_submit.png" alt="提交"></button>
+    <button id="btnAnswer"><img src="img/btn_answer.png" alt="查看答案"></button>
+  </div>
+  <div class="score" id="score">
+    <div class="big" id="scoreBig"></div>
+    <div class="tip" id="scoreTip"></div>
+    <button onclick="location.reload()">再玩一次</button>
+  </div>
+</div>
+
+<script src="questions.js"></script>
+<script>
+// ===== 判题流程还原 (对照反编译 Main.as / answerPanel.as / TopicPane.as) =====
+// - 点"请判断"面板 -> 展开√× (answerPanel.answerPHandler: gotoAndStop(2))
+// - 点√或× -> 锁定选择并显示 (rightPHandler) ; 再点可改选 (rightPHandler2)
+// - "提交" -> 每题显示对错大标记 Duicuo (Main.submitHandler), 并出现"查看答案"
+// - "查看答案" -> 显示标准答案 (Main.closeHandler)
+// - "重新开始" -> 全部还原 (Main.resetHandler)
+
+const IMG_RIGHT = 'img/right.png', IMG_WRONG = 'img/wrong.png';
+const DUICUO = { right: 'img/duicuo_right.png', wrong: 'img/duicuo_wrong.png' };
+
+document.getElementById('header').textContent = QUIZ_DATA.name;
+const pic = document.getElementById('qpic');
+pic.src = 'img/pic_01.png';   // 原 SWF createBit 固定加载 pic/01.png
+
+const list = document.getElementById('qlist');
+QUIZ_DATA.questions.forEach((q, i) => {
+  const div = document.createElement('div');
+  div.className = 'q';
+  div.innerHTML = `
+    <div class="qtext">${q.txt}</div>
+    <div class="qops">
+      <button class="btn-please" data-i="${i}"><img src="img/please_normal.png" alt="请判断"></button>
+      <span class="choice" id="choice${i}">
+        <button data-v="right"><img src="${IMG_RIGHT}" alt="正确"></button>
+        <button data-v="wrong"><img src="${IMG_WRONG}" alt="错误"></button>
+      </span>
+      <span class="chosen" id="chosen${i}"></span>
+      <span class="verdict" id="verdict${i}"></span>
+      <span class="result-mark" id="result${i}"></span>
+    </div>`;
+  list.appendChild(div);
+});
+
+const userAns = new Array(QUIZ_DATA.questions.length).fill('');
+let submitted = false;
+
+// 1) 点"请判断" -> 展开 √×
+document.querySelectorAll('.btn-please').forEach(btn => {
+  btn.onclick = () => {
+    if (submitted) return;
+    btn.style.display = 'none';
+    document.getElementById('choice' + btn.dataset.i).classList.add('show');
+  };
+});
+
+// 2) 选 √ 或 × ; 已选后仍可改选(与 rightPHandler2 一致)
+document.querySelectorAll('.choice').forEach(sp => {
+  const i = +sp.id.replace('choice', '');
+  sp.querySelectorAll('button').forEach(b => {
+    b.onclick = () => {
+      if (submitted) return;
+      userAns[i] = b.dataset.v;
+      const ch = document.getElementById('chosen' + i);
+      ch.innerHTML = `<img src="${b.dataset.v === 'right' ? IMG_RIGHT : IMG_WRONG}">`;
+      ch.style.display = 'inline';
+      sp.classList.remove('show');
+    };
+  });
+});
+
+// 3) 提交 -> 判分并显示 Duicuo
+const btnSubmit = document.getElementById('btnSubmit');
+btnSubmit.onclick = () => {
+  if (userAns.some(a => !a)) { alert('还有题目未作答'); return; }
+  submitted = true;
+  let right = 0;
+  QUIZ_DATA.questions.forEach((q, i) => {
+    const ok = userAns[i] === q.answer;
+    if (ok) right++;
+    const v = document.getElementById('verdict' + i);
+    v.innerHTML = `<img src="${DUICUO[q.answer]}">`;  // Duicuo.gotoAndStop(1=对/2=错)
+    v.style.display = 'inline';
+  });
+  btnSubmit.style.display = 'none';
+  document.getElementById('btnAnswer').classList.add('always');
+  const pct = Math.round(right / QUIZ_DATA.questions.length * 100);
+  document.getElementById('scoreBig').textContent = `${right} / ${QUIZ_DATA.questions.length} 题`;
+  document.getElementById('scoreTip').textContent = `正确率 ${pct}%` + (pct === 100 ? ' —— 全对，真棒！' : '');
+  document.getElementById('score').style.display = 'block';
+};
+
+// 4) 查看答案 -> 每题显示标准答案 (closeHandler: answerDC)
+document.getElementById('btnAnswer').onclick = () => {
+  QUIZ_DATA.questions.forEach((q, i) => {
+    const r = document.getElementById('result' + i);
+    r.innerHTML = `答案 <img class="judge-mark" src="${q.answer === 'right' ? IMG_RIGHT : IMG_WRONG}">`;
+    r.style.display = 'inline';
+  });
+  document.getElementById('score').style.display = 'none';
+};
+
+// 5) 重新开始 -> 全部还原 (resetHandler)
+document.getElementById('btnReset').onclick = () => location.reload();
+
+// 自测钩子: ?autotest=1 模拟学生按标准答案作答并提交(仅用于自动化验证)
+if (new URLSearchParams(location.search).get('autotest')) {
+  setTimeout(() => {
+    document.querySelectorAll('.btn-please').forEach(b => b.click());
+    document.querySelectorAll('.choice').forEach(sp => {
+      const i = +sp.id.replace('choice', '');
+      sp.querySelector(`button[data-v="${QUIZ_DATA.questions[i].answer}"]`).click();
+    });
+    setTimeout(() => document.getElementById('btnSubmit').click(), 100);
+  }, 50);
+}
+</script>
+</body>
+</html>

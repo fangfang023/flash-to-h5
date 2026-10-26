@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>原始 SWF 播放器</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
+         background:#1e2836; color:#dce8f4; min-height:100vh;
+         display:flex; flex-direction:column; align-items:center; padding:20px; }
+  h1 { font-size:20px; font-weight:600; margin-bottom:14px; }
+  .list { display:flex; flex-wrap:wrap; gap:10px; justify-content:center; margin-bottom:16px; }
+  .item { padding:9px 18px; border-radius:8px; border:1px solid #3a4a5e; background:#2a3849;
+          color:#dce8f4; font-size:15px; cursor:pointer; }
+  .item.active { background:#2a86c8; border-color:#2a86c8; }
+  .item .sub { display:block; font-size:11px; color:#8fb4d4; margin-top:2px; }
+  .item.active .sub { color:#cfe9ff; }
+  .stage-wrap { position:relative; width:min(96vw, 760px); }
+  #stage { width:100%; aspect-ratio:720/576; background:#000; border-radius:10px;
+           box-shadow:0 8px 32px rgba(0,0,0,.5); overflow:hidden; }
+  #stage ruffle-embed, #stage ruffle-object { width:100%; height:100%; display:block; }
+  .toolbar { display:flex; align-items:center; gap:10px; margin-top:12px; font-size:13px; color:#8fb4d4; }
+  button { padding:7px 16px; border-radius:8px; border:1px solid #3a4a5e; background:#2a3849;
+           color:#dce8f4; font-size:14px; cursor:pointer; }
+  button:hover { background:#34465c; }
+  .note { max-width:760px; margin-top:10px; font-size:12px; color:#6d88a3; line-height:1.6; text-align:center; }
+</style>
+</head>
+<body>
+<h1>原始 SWF 播放器（Ruffle 模拟）</h1>
+<div class="list" id="list"></div>
+<div class="stage-wrap">
+  <div id="stage"></div>
+</div>
+<div class="toolbar">
+  <button id="reload">↻ 重新加载</button>
+  <button id="unload">■ 卸载</button>
+  <span id="status">选择一个 SWF 开始</span>
+</div>
+<div class="note">
+  需通过 HTTP 访问（file:// 无法加载 WASM 与 SWF 资源）：<br>
+  在 swf-player 目录执行 <code>python3 -m http.server 8080</code>，浏览器打开 <code>http://localhost:8080</code>
+</div>
+
+<script>
+// SWF 清单：相对路径 + Flash 原始舞台尺寸（twip/20 = px）
+const SWFS = [
+  { file: "swfs/welcome.swf",     name: "welcome",    w: 720, h: 576 },
+  { file: "swfs/teacher.swf",     name: "teacher",    w: 720, h: 576 },
+  { file: "swfs/Egypt.swf",       name: "Egypt",      w: 720, h: 576 },
+  { file: "swfs/姹.swf",           name: "姹（识字卡）", w: 720, h: 576 },
+  { file: "swfs/嫣.swf",           name: "嫣（识字卡）", w: 720, h: 576 },
+  { file: "swfs/填空乐园/圆填空乐园.swf", name: "填空乐园",  w: 800, h: 600 },
+  { file: "swfs/我是小法官/圆我是小法官.swf", name: "我是小法官", w: 800, h: 600 },
+];
+
+let current = null;   // 当前 ruffle 实例
+
+async function loadSwf(item, idx) {
+  document.querySelectorAll('.item').forEach((el,i)=>el.classList.toggle('active', i===idx));
+  unload();
+  const { file, w, h } = SWFS[idx];
+  document.getElementById('stage').style.aspectRatio = `${w}/${h}`;
+  document.getElementById('status').textContent = '加载中: ' + file;
+  try {
+    const dir = file.substring(0, file.lastIndexOf("/") + 1); // SWF 所在目录
+    const config = {
+      letterbox: "on",          // 保持宽高比
+      scale: "showAll",         // 与 Flash Player 缩放模式一致
+      autoplay: "on",
+      unmuteOverlay: "visible", // 浏览器自动播放策略下首次需要点击解锁声音
+      logLevel: "warn",
+      // 浏览器沙箱里 Ruffle 拿不到系统字体，必须自备 TTF 并注册给设备字体名。
+      // 注意: 字体以 fontSources 里的 URL 字符串为注册名（ttf 缺 full-name 时），
+      // defaultFonts 必须填一模一样的字符串才能匹配。
+      fontSources: ["fonts/黑体.ttf", "fonts/宋体.ttf"],
+      defaultFonts: {
+        sans:       ["fonts/黑体.ttf", "fonts/宋体.ttf"],
+        serif:      ["fonts/宋体.ttf", "fonts/黑体.ttf"],
+        typewriter: ["fonts/黑体.ttf", "fonts/宋体.ttf"],
+      },
+      // AS3 课件按"页面URL"解析 data.xml/pic/ 相对路径，重写回 SWF 所在目录
+      // （规则匹配被替换的子串，绝对/相对形态都兼容）
+      urlRewriteRules: [
+        [/data\.xml$/, dir + "data.xml"],
+        [/pic\//,        dir + "pic/"],
+      ],
+    };
+    const player = window.RufflePlayer.newest().createPlayer();
+    document.getElementById('stage').appendChild(player);
+    player.style.width = '100%';
+    player.style.height = '100%';
+    await player.load({ url: file, ...config });   // 单对象参数: url + 配置
+    current = player;
+    document.getElementById('status').textContent = `播放中: ${SWFS[idx].name} (${w}×${h})`;
+  } catch (e) {
+    document.getElementById('status').textContent = '加载失败: ' + e.message;
+  }
+}
+
+function unload() {
+  if (current) { try { current.remove(); } catch(e){} current = null; }
+  document.getElementById('stage').innerHTML = '';
+}
+
+document.getElementById('list').innerHTML = SWFS.map((s,i) =>
+  `<button class="item" onclick="loadSwf(this, ${i})">${s.name}<span class="sub">${s.file}</span></button>`).join('');
+
+document.getElementById('reload').onclick = () => { if (current) { const i = [...document.querySelectorAll('.item')].findIndex(el=>el.classList.contains('active')); loadSwf(null, i); } };
+document.getElementById('unload').onclick = unload;
+
+</script>
+<script src="ruffle/ruffle.js"></script>
+</body>
+</html>
