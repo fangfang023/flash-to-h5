@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>welcome</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
+         background:linear-gradient(180deg,#aee3ff,#e8f7ff 60%,#cdeffd);
+         display:flex; flex-direction:column; align-items:center; justify-content:center;
+         min-height:100vh; }
+  .stage { position:relative; width:min(96vw,720px); user-select:none; overflow:hidden;
+            border-radius:8px; box-shadow:0 6px 24px rgba(60,120,180,.25); }
+  .stage video { display:block; width:100%; }
+  .hotspot { position:absolute; cursor:pointer; z-index:2; }
+  .hotspot .overImg { display:none; width:100%; height:100%; }
+  .hotspot:hover { transform:scale(1.06); filter:drop-shadow(0 0 6px rgba(255,180,60,.8)); }
+  .hotspot:hover .overImg { display:block; }
+  .hotspot:active { transform:scale(.96); }
+</style>
+</head>
+<body>
+<div class="stage" id="stage">
+  <video id="player" playsinline preload="auto"></video>
+</div>
+<script>
+// mp4 方案: 每页视频 = 页动画+旁白焊死(CRF16近无损); 热区/Over态/音效同帧序列版
+const PAGES = [{"video": "videos/p1.mp4", "dur": 6.8}, {"video": "videos/p2.mp4", "dur": 10.0}, {"video": "videos/p3.mp4", "dur": 6.56}, {"video": "videos/p4.mp4", "dur": 10.0}];          // [{video:'videos/p1.mp4', dur:秒}]
+const HOTSPOTS = [{"x": 618.8, "y": 418.9, "w": 52.1, "h": 32.1, "seg": 2, "snd": "snd_42.mp3", "over": "over_43.png"}, {"x": 649.1, "y": 426.3, "w": 72.8, "h": 43.4, "seg": 4, "snd": "snd_42.mp3", "over": "over_47.png"}, {"x": 641.4, "y": 262.9, "w": 80.8, "h": 90.0, "seg": 3, "snd": "snd_42.mp3", "over": "over_146.png"}, {"x": 2.6, "y": 407.2, "w": 103.2, "h": 65.3, "seg": 1, "snd": "snd_42.mp3", "over": "over_151.png"}];
+const W = 720, H = 576;
+let page = 1;
+const p = document.getElementById('player');
+const stage = document.getElementById('stage');
+
+function renderHotspots() {
+  stage.querySelectorAll('.hotspot').forEach(e => e.remove());
+  HOTSPOTS.forEach(h => {
+    if (h.seg == null) return;
+    const d = document.createElement('div');
+    d.className = 'hotspot';
+    d.style.left = (h.x / W * 100) + '%';
+    d.style.top = (h.y / H * 100) + '%';
+    d.style.width = (h.w / W * 100) + '%';
+    d.style.height = (h.h / H * 100) + '%';
+    if (h.over) {
+      const ov = document.createElement('img');
+      ov.src = h.over;
+      ov.className = 'overImg';
+      d.appendChild(ov);
+    }
+    const snd = h.snd ? new Audio(h.snd) : null;
+    d.onclick = () => {
+      if (snd) { snd.currentTime = 0; snd.play().catch(()=>{}); }
+      goto(h.seg);
+    };
+    stage.appendChild(d);
+  });
+}
+function playPage(seg) {
+  page = seg;
+  p.src = PAGES[page-1].video;
+  p.play().catch(()=>{});
+}
+function goto(seg) {
+  if (seg < 1 || seg > PAGES.length) return;
+  playPage(seg);
+}
+// 播完停住(不循环) = 原SWF stop(); 其余页视频后台预载
+p.addEventListener('ended', () => { /* 停在末帧 */ });
+PAGES.forEach(pd => { if (pd.video) { const v = document.createElement('video'); v.src = pd.video; v.preload='auto'; } });
+renderHotspots();
+playPage(1);
+</script>
+</body>
+</html>

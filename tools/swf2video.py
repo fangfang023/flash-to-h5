@@ -200,6 +200,194 @@ def slice_audio(track: Path, t0: float, dur: float, out: Path):
                    check=True, capture_output=True)
 
 
+def build_page_audio(tl: dict, pages: list, workdir: Path, stem: str,
+                     outdir: Path, SR: int = 44100) -> list:
+    """按 SWF 流音块的时间轴位置重建每页音频(切片正确性修复)。
+
+    教训: mp3 文件的解码时长 ≠ SWF 时间轴窗口(mp3帧与SWF帧边界不对齐,
+    teacher: 块窗口 0~27.4s, mp3 文件却 23.3s)。按文件时长切片会错位、丢段
+    (P4"例句"讲解音丢失的根因)。正确算法 = 整条模式的 canvas 铺 PCM:
+      1. 各块的 MP3 数据顺序拼接解码(块[4字节头]已由JPEXS的-1.mp3处理)
+      2. 但拼接 mp3 的时长要按"块窗口"映射回 SWF 时间轴, 不能按文件时长
+    实现: 解码整条轨为 PCM → 按 (块起始帧时间戳 / 块窗口总时长) 的线性映射
+    重铺到整条时间轴 canvas → 按页窗口切 PCM → 编码 mp3。
+    返回 [每页音频路径或None]。
+    """
+    import io as _io, wave as _wave
+    fps = tl['fps']
+    total_audio = tl['audio']
+    frames_sorted = sorted(total_audio)
+    if not frames_sorted:
+        return [None] * len(pages)
+    # 块窗口: 首块帧到末块帧+1 的时间范围
+    w_start = (frames_sorted[0] - 1) / fps
+    w_end = (frames_sorted[-1] + 1) / fps
+    w_dur = w_end - w_start
+    # 解码整条轨(JPEXS -1.mp3)
+    track = export_audio_from_blocks(tl, workdir, stem)
+    if track is None:
+        return [None] * len(pages)
+    wavf = workdir / f'{stem}_full_pcm.wav'
+    subprocess.run(['ffmpeg', '-y', '-i', str(track), '-ar', str(SR), '-ac', '2',
+                    '-c:a', 'pcm_s16le', str(wavf)], capture_output=True)
+    w = _wave.open(str(wavf))
+    pcm = w.readframes(w.getnframes())
+    w.close()
+    n_samples = len(pcm) // 4   # stereo 16bit
+    file_dur = n_samples / SR
+    # 线性映射: SWF时间 ∈ [w_start, w_end] → PCM时间 ∈ [0, file_dur]
+    def swf_to_pcm(t_swf):
+        if t_swf <= w_start:
+            return 0.0
+        if t_swf >= w_end:
+            return file_dur
+        return (t_swf - w_start) / w_dur * file_dur
+    # 整条时间轴 canvas(每帧窗口铺对应的PCM段)
+    total_frames = tl['frames']
+    canvas_dur = total_frames / fps
+    canvas = bytearray(int(canvas_dur * SR) * 4)
+    for i, f in enumerate(frames_sorted):
+        seg_t0 = swf_to_pcm((f - 1) / fps)
+        seg_t1 = swf_to_pcm(min(f / fps, w_end))
+        if seg_t1 <= seg_t0:
+            continue
+        s0 = int(seg_t0 * SR) * 4
+        s1 = min(int(seg_t1 * SR) * 4, len(pcm))
+        if s1 <= s0:
+            continue
+        d_pos = int(((f - 1) / fps) * SR) * 4
+        d_end = min(d_pos + (s1 - s0), len(canvas))
+        canvas[d_pos:d_end] = pcm[s0:s1]
+    # 按页切 canvas → mp3
+    out_paths = []
+    for i, (f0, f1) in enumerate(pages, 1):
+        p0 = int(((f0 - 1) / fps) * SR) * 4
+        p1 = min(int((f1 / fps) * SR) * 4, len(canvas))
+        seg = bytes(canvas[p0:p1])
+        if not any(f0 <= f <= f1 for f in frames_sorted):
+            out_paths.append(None)
+            continue
+        wav_seg = workdir / f'{stem}_p{i}.wav'
+        w2 = _wave.open(str(wav_seg), 'wb')
+        w2.setnchannels(2); w2.setsampwidth(2); w2.setframerate(SR)
+        w2.writeframes(seg)
+        w2.close()
+        mp3 = outdir / f'p{i}.mp3'
+        subprocess.run(['ffmpeg', '-y', '-i', str(wav_seg), '-c:a', 'libmp3lame',
+                        '-q:a', '0', str(mp3)], capture_output=True)
+        wav_seg.unlink(missing_ok=True)
+        out_paths.append(mp3 if mp3.exists() and mp3.stat().st_size > 1000 else None)
+    wavf.unlink(missing_ok=True)
+    return out_paths
+
+
+def export_audio_from_blocks(tl: dict, workdir: Path, stem: str) -> Path | None:
+    """把 scan_timeline 收集的流音块重新拼接成整条 mp3(含4字节头剥离)。
+    独立于 JPEXS 的 -1.mp3(两者应一致, 此处自证可控)。"""
+    import io as _io, wave as _wave
+    blocks = tl['audio']
+    if not blocks:
+        return None
+    # 块payload: [samples:u16][seek:u16][MP3帧...] — 剥前4字节
+    stream = b''.join((blocks[f][4:] if len(blocks[f]) > 8 else blocks[f])
+                      for f in sorted(blocks))
+    mp3 = workdir / f'{stem}_stream.mp3'
+    mp3.write_bytes(stream)
+    return mp3
+
+
+def extract_button_over_states(swf: Path, swf_xml: Path, workdir: Path,
+                               outdir: Path, btn_ids: list) -> dict:
+    """提取每个按钮的 Over 态(buttonStateOver=true 的 BUTTONRECORD 的形状)渲染成PNG。
+    忠实还原: 原Flash按钮hover时显示Over态(变大/变亮/换图——都定义在按钮元件里)。
+    返回 {buttonId: 'over_<cid>.png'}。
+    实现: 直接用 JPEXS 按 shapeId 导出 Over 态形状(剪XML重渲染的路线在
+    JPEXS 对"只剩Over记录的按钮"的渲染上不可靠, 已废弃)。
+    注意: Over态若是sprite而非shape, 退化跳过(罕见)。"""
+    import xml.etree.ElementTree as ET
+    import shutil
+    sys.path.insert(0, str(Path(__file__).parent))
+    from swf2card import SwfModel
+    model = SwfModel(swf_xml)
+    # 收集每个按钮的Over态shape id
+    over_shapes = {}
+    for cid in btn_ids:
+        for it in model.tags:
+            if (it.get('type') or '') in ('DefineButtonTag', 'DefineButton2Tag') \
+                    and it.get('buttonId') == str(cid):
+                for r in it.iter('item'):
+                    if r.get('type') == 'BUTTONRECORD' and r.get('buttonStateOver') == 'true':
+                        ocid = r.get('characterId')
+                        if ocid and ocid != '0':
+                            over_shapes[cid] = int(ocid)
+                break
+    if not over_shapes:
+        return {}
+    # 区分shape与sprite(JPEXS -format shape:png 只导DefineShape)
+    shape_ids = [s for s in over_shapes.values() if s in model.char_bounds]
+    sprite_ids = [s for s in over_shapes.values() if s in model.sprites]
+    name_by_shape = {v: k for k, v in over_shapes.items()}
+    out = {}
+    if shape_ids:
+        id_arg = ','.join(str(s) for s in sorted(set(shape_ids)))
+        sh_dir = workdir / 'over_shapes'
+        subprocess.run(['java', '-jar', str(FFDEC), '-selectid', id_arg,
+                        '-format', 'shape:png', '-export', 'shape',
+                        sh_dir.resolve(), swf.name], cwd=swf.parent, capture_output=True)
+        for f in sh_dir.glob('*.png'):
+            sid = int(f.stem)
+            cid = name_by_shape.get(sid)
+            if cid is not None:
+                name = f'over_{cid}.png'
+                shutil.copy(f, outdir / name)
+                out[str(cid)] = name
+        shutil.rmtree(sh_dir, ignore_errors=True)
+    # Over态是sprite的: 用solo渲染提取(按按钮放置矩阵换算裁剪略复杂, 暂跳过)
+    if sprite_ids:
+        print(f"  Over态为sprite的按钮(暂跳过): {name_by_shape.get(s) for s in sprite_ids}")
+    return out
+
+
+def extract_button_sounds(swf: Path, swf_xml: Path, outdir: Path) -> dict:
+    """逐按钮提取 Down 态音效(DefineButtonSound buttonSoundChar2)。
+    返回 {buttonId: 'snd_<soundId>.mp3'} — 修正旧版只导一个共用 click.mp3。"""
+    import xml.etree.ElementTree as ET
+    import shutil
+    work = outdir / "_meta"
+    work.mkdir(parents=True, exist_ok=True)
+    xmlp = work / f"{swf.stem}.xml"
+    r = subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name, xmlp.resolve()],
+                       cwd=swf.parent, capture_output=True)
+    if r.returncode != 0:
+        return {}
+    root = ET.parse(xmlp).getroot()
+    btn2snd = {}
+    for it in root.iter('item'):
+        if (it.get('type') or '') == 'DefineButtonSoundTag':
+            bid = it.get('buttonId')
+            sid = it.get('buttonSoundChar2')
+            if bid and sid and sid != '0':
+                btn2snd[bid] = int(sid)
+    out = {}
+    for bid, sid in sorted(set(btn2snd.items()), key=lambda kv: kv[1]):
+        name = f'snd_{sid}.mp3'
+        if not (outdir / name).exists():
+            snd_dir = work / f"snd{sid}"
+            subprocess.run(['java', '-jar', str(FFDEC), '-selectid', str(sid),
+                            '-export', 'sound', snd_dir.resolve(), swf.name],
+                           cwd=swf.parent, capture_output=True)
+            f = next(iter(snd_dir.glob('*')), None)
+            if f is not None:
+                subprocess.run(['ffmpeg', '-y', '-i', str(f), '-ar', '44100',
+                                '-c:a', 'libmp3lame', '-q:a', '3', str(outdir / name)],
+                               capture_output=True)
+            shutil.rmtree(snd_dir, ignore_errors=True)
+        if (outdir / name).exists():
+            out[bid] = name
+    shutil.rmtree(work, ignore_errors=True)
+    return out
+
+
 def encode_segment(frames_dir: Path, n_frames: int, audio: Path | None,
                    out: Path, fps: float):
     dur = n_frames / fps
@@ -210,7 +398,7 @@ def encode_segment(frames_dir: Path, n_frames: int, audio: Path | None,
     else:
         cmd += ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
                 '-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '96k']
-    cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '20', '-preset', 'medium',
+    cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '16', '-preset', 'medium',
             '-t', f'{dur:.3f}', '-movflags', '+faststart', str(out)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -228,6 +416,37 @@ def _cleanup(workdir: Path, stem: str):
 
 # ---------- 播放页 ----------
 
+# 按钮 Over 态图 + 逐按钮音效的公共 JS 片段(两个模板共用)
+HOTSPOT_JS = """const HOTSPOTS = __HOTSPOTS__;
+const W = __W__, H = __H__;
+function renderHotspots(stage, onGoto) {
+  stage.querySelectorAll('.hotspot').forEach(e => e.remove());
+  HOTSPOTS.forEach(h => {
+    if (h.seg == null) return;
+    const d = document.createElement('div');
+    d.className = 'hotspot';
+    d.style.left = (h.x / W * 100) + '%';
+    d.style.top = (h.y / H * 100) + '%';
+    d.style.width = (h.w / W * 100) + '%';
+    d.style.height = (h.h / H * 100) + '%';
+    // Over态图: hover时叠加(SWF按钮元件定义的悬浮变体 — 变大/变亮/换图都来自这里)
+    if (h.over) {
+      const ov = document.createElement('img');
+      ov.src = h.over;
+      ov.className = 'overImg';
+      ov.style.width = '100%';
+      d.appendChild(ov);
+    }
+    // 逐按钮音效
+    const snd = h.snd ? new Audio(h.snd) : null;
+    d.onclick = () => {
+      if (snd) { snd.currentTime = 0; snd.play().catch(()=>{}); }
+      onGoto(h.seg);
+    };
+    stage.appendChild(d);
+  });
+}"""
+
 ANIM_TMPL = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -244,9 +463,11 @@ ANIM_TMPL = """<!DOCTYPE html>
             border-radius:8px; box-shadow:0 6px 24px rgba(60,120,180,.25); }
   .stage img.frame { display:block; width:100%; }
   /* 画面内按钮热区: 位置/大小来自SWF放置矩阵, 按钮 Up 态已印在帧里 */
-  .hotspot { position:absolute; cursor:pointer; z-index:2;
-              transition:transform .15s ease; }
-  .hotspot:hover { transform:scale(1.12); filter:drop-shadow(0 0 6px rgba(255,180,60,.9)); }
+  .hotspot { position:absolute; cursor:pointer; z-index:2; }
+  .hotspot .overImg { display:none; width:100%; height:100%; }
+  /* hover: 显示SWF按钮元件定义的Over态图(还原原片变大/变亮/换门开等悬浮变体) */
+  .hotspot:hover { transform:scale(1.06); filter:drop-shadow(0 0 6px rgba(255,180,60,.8)); }
+  .hotspot:hover .overImg { display:block; }
   .hotspot:active { transform:scale(.96); }
 </style>
 </head>
@@ -266,16 +487,28 @@ const stage = document.getElementById('stage');
 const clickSnd = new Audio('click.mp3');
 function playClick(){ clickSnd.currentTime = 0; clickSnd.play().catch(()=>{}); }
 
+// Over态图 + 逐按钮音效: 每个热区 {x,y,w,h,seg,snd,over}
 function renderHotspots() {
   stage.querySelectorAll('.hotspot').forEach(e => e.remove());
   HOTSPOTS.forEach(h => {
+    if (h.seg == null) return;
     const d = document.createElement('div');
     d.className = 'hotspot';
     d.style.left = (h.x / W * 100) + '%';
     d.style.top = (h.y / H * 100) + '%';
     d.style.width = (h.w / W * 100) + '%';
     d.style.height = (h.h / H * 100) + '%';
-    d.onclick = () => goto(h.seg);
+    if (h.over) {
+      const ov = document.createElement('img');
+      ov.src = h.over;
+      ov.className = 'overImg';
+      d.appendChild(ov);
+    }
+    const snd = h.snd ? new Audio(h.snd) : null;
+    d.onclick = () => {
+      if (snd) { snd.currentTime = 0; snd.play().catch(()=>{}); }
+      goto(h.seg);
+    };
     stage.appendChild(d);
   });
 }
@@ -320,6 +553,85 @@ PAGES.forEach((pd, i) => pd.frames.forEach(f => {
 setTimeout(() => Object.values(preloadPool).forEach(fn => fn()), 3000);
 renderHotspots();
 playPage(1);   // 打开即播第1页(与原SWF一致)
+</script>
+</body>
+</html>
+"""
+
+# mp4 方案: 画面+旁白焊死在每页一个mp4里(CRF16近无损), 热区/Over态/音效与帧序列版相同
+MP4_TMPL = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>__TITLE__</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
+         background:linear-gradient(180deg,#aee3ff,#e8f7ff 60%,#cdeffd);
+         display:flex; flex-direction:column; align-items:center; justify-content:center;
+         min-height:100vh; }
+  .stage { position:relative; width:min(96vw,__W__px); user-select:none; overflow:hidden;
+            border-radius:8px; box-shadow:0 6px 24px rgba(60,120,180,.25); }
+  .stage video { display:block; width:100%; }
+  .hotspot { position:absolute; cursor:pointer; z-index:2; }
+  .hotspot .overImg { display:none; width:100%; height:100%; }
+  .hotspot:hover { transform:scale(1.06); filter:drop-shadow(0 0 6px rgba(255,180,60,.8)); }
+  .hotspot:hover .overImg { display:block; }
+  .hotspot:active { transform:scale(.96); }
+</style>
+</head>
+<body>
+<div class="stage" id="stage">
+  <video id="player" playsinline preload="auto"></video>
+</div>
+<script>
+// mp4 方案: 每页视频 = 页动画+旁白焊死(CRF16近无损); 热区/Over态/音效同帧序列版
+const PAGES = __PAGES__;          // [{video:'videos/p1.mp4', dur:秒}]
+const HOTSPOTS = __HOTSPOTS__;
+const W = __W__, H = __H__;
+let page = 1;
+const p = document.getElementById('player');
+const stage = document.getElementById('stage');
+
+function renderHotspots() {
+  stage.querySelectorAll('.hotspot').forEach(e => e.remove());
+  HOTSPOTS.forEach(h => {
+    if (h.seg == null) return;
+    const d = document.createElement('div');
+    d.className = 'hotspot';
+    d.style.left = (h.x / W * 100) + '%';
+    d.style.top = (h.y / H * 100) + '%';
+    d.style.width = (h.w / W * 100) + '%';
+    d.style.height = (h.h / H * 100) + '%';
+    if (h.over) {
+      const ov = document.createElement('img');
+      ov.src = h.over;
+      ov.className = 'overImg';
+      d.appendChild(ov);
+    }
+    const snd = h.snd ? new Audio(h.snd) : null;
+    d.onclick = () => {
+      if (snd) { snd.currentTime = 0; snd.play().catch(()=>{}); }
+      goto(h.seg);
+    };
+    stage.appendChild(d);
+  });
+}
+function playPage(seg) {
+  page = seg;
+  p.src = PAGES[page-1].video;
+  p.play().catch(()=>{});
+}
+function goto(seg) {
+  if (seg < 1 || seg > PAGES.length) return;
+  playPage(seg);
+}
+// 播完停住(不循环) = 原SWF stop(); 其余页视频后台预载
+p.addEventListener('ended', () => { /* 停在末帧 */ });
+PAGES.forEach(pd => { if (pd.video) { const v = document.createElement('video'); v.src = pd.video; v.preload='auto'; } });
+renderHotspots();
+playPage(1);
 </script>
 </body>
 </html>
@@ -495,15 +807,17 @@ def convert(swf: Path, workdir: Path, outdir: Path, results: dict,
     return n_pages
 
 
-def convert_animated(swf: Path, workdir: Path, outdir: Path, keep_work: bool = False):
+def convert_animated(swf: Path, workdir: Path, outdir: Path, keep_work: bool = False,
+                     use_mp4: bool = False):
     """忠实还原产物形态: 一个SWF → 一个独立H5动画页。
-    页内动画 = 逐帧PNG序列 + JS帧驱动(字幕/按钮Up态已印在帧里);
-    旁白 = 每页一个mp3, 与帧同步播放; 按钮 = 画面内热区(hover放大,
-    点击播原按钮音效); 页尾停住 = 原SWF的 stop()。"""
+    use_mp4=False: 页内动画 = 逐帧webp序列 + JS帧驱动(字幕/按钮Up态已印在帧里)
+    use_mp4=True:  页内动画 = 每页一个mp4(画面+旁白焊死, CRF16近无损) — 批量分发形态
+    两者共用: 按钮热区(画面内原位, hover叠Over态图) + 逐按钮音效 + 页跳转(AS2)
+    页尾停住 = 原SWF的 stop()。"""
     import shutil
     name = swf.stem
     stem = re.sub(r'[^\w\-]', '_', name)
-    print(f"\n== {name} (动画页模式) ==")
+    print(f"\n== {name} ({'mp4动画页' if use_mp4 else '帧序列动画页'}) ==")
     raw = decompress(swf)
     tl = scan_timeline(raw)
     pages = detect_pages(tl)
@@ -519,45 +833,57 @@ def convert_animated(swf: Path, workdir: Path, outdir: Path, keep_work: bool = F
                     break
     print(f"  时间轴: {tl['frames']}帧 @{tl['fps']:.0f}fps, 页: {pages}, 按钮: {btn_map}")
 
-    # 帧序列(整条导出一次)
+    # 帧序列(整条导出一次; mp4模式也用它编码)
     frames_dir = workdir / f"frames_{stem}"
-    n_exported = export_frames(swf, frames_dir)
-    track = export_audio(swf, workdir / f"audio_{stem}")
+    export_frames(swf, frames_dir)
     # 舞台尺寸: 从第1帧PNG读
     from PIL import Image
-    first_png = frames_dir / '1.png'
-    W, H = Image.open(first_png).size
+    W, H = Image.open(frames_dir / '1.png').size
 
-    # 输出结构: outdir/<stem>/frames/*.jpg + p*.mp3 + <stem>.html + click.mp3
+    # 输出目录
     out = outdir / stem
     out.mkdir(parents=True, exist_ok=True)
-    fr_out = out / 'frames'
-    fr_out.mkdir(exist_ok=True)
+
+    # ===== 页旁白: 按SWF块时间轴铺PCM(修复切片错位/丢段) =====
+    page_audios = build_page_audio(tl, pages, workdir, stem, out)
 
     page_defs = []
-    for i, (f0, f1) in enumerate(pages, 1):
-        # 帧转webp q80(比同质量jpg小40%, 字幕/木牌文字细节验证无损)
-        names = []
-        for f in range(f0, f1 + 1):
-            src = frames_dir / f'{f}.png'
-            if not src.exists():
-                continue
-            dst = fr_out / f'p{i}_{f - f0 + 1:03d}.webp'
-            subprocess.run(['ffmpeg', '-y', '-i', str(src), '-quality', '80', str(dst)],
-                           capture_output=True)
-            names.append(f'frames/{dst.name}')
-        # 页旁白
-        aud_name = None
-        has_sound = any(f0 <= f <= f1 for f in tl['audio'])
-        if track and has_sound:
-            seg = out / f'p{i}.mp3'
-            slice_audio(track, (f0 - 1) / tl['fps'], (f1 - f0 + 1) / tl['fps'], seg)
-            aud_name = seg.name
-        page_defs.append(dict(frames=names, audio=aud_name,
-                              dur=round((f1 - f0 + 1) / tl['fps'], 2)))
-        print(f"  p{i}: {len(names)}帧 {(f1-f0+1)/tl['fps']:.2f}s 音频{'✓' if aud_name else '无'}")
+    if use_mp4:
+        # mp4: 帧序列编码, 音频焊死
+        seg_out = out / 'videos'
+        seg_out.mkdir(exist_ok=True)
+        for i, (f0, f1) in enumerate(pages, 1):
+            nf = f1 - f0 + 1
+            aud = page_audios[i-1]
+            # build_page_audio 输出的mp3在 out/ 下 — 编码后可保留(兜底)或删除
+            encode_segment(frames_dir, nf, aud,
+                           seg_out / f'p{i}.mp4', tl['fps'])
+            page_defs.append(dict(video=f'videos/p{i}.mp4',
+                                  dur=round(nf / tl['fps'], 2)))
+            print(f"  p{i}: mp4 {nf}帧={nf/tl['fps']:.2f}s 音频{'✓' if aud else '静音'}")
+            if aud and aud.exists():
+                aud.unlink()   # 音频已在mp4里, 单独mp3不再需要
+    else:
+        # 帧序列: webp + 每页mp3
+        fr_out = out / 'frames'
+        fr_out.mkdir(exist_ok=True)
+        for i, (f0, f1) in enumerate(pages, 1):
+            names = []
+            for f in range(f0, f1 + 1):
+                src = frames_dir / f'{f}.png'
+                if not src.exists():
+                    continue
+                dst = fr_out / f'p{i}_{f - f0 + 1:03d}.webp'
+                subprocess.run(['ffmpeg', '-y', '-i', str(src), '-quality', '80', str(dst)],
+                               capture_output=True)
+                names.append(f'frames/{dst.name}')
+            aud = page_audios[i-1]
+            page_defs.append(dict(frames=names,
+                                  audio=aud.name if aud else None,
+                                  dur=round((f1 - f0 + 1) / tl['fps'], 2)))
+            print(f"  p{i}: {len(names)}帧 {(f1-f0+1)/tl['fps']:.2f}s 音频{'✓' if aud else '无'}")
 
-    # 按钮热区 + 跳转
+    # ===== 按钮热区 + Over态 + 逐按钮音效 =====
     hotspots = []
     r2 = subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name,
                          (workdir / 'hot.xml').resolve()], cwd=swf.parent, capture_output=True)
@@ -566,11 +892,18 @@ def convert_animated(swf: Path, workdir: Path, outdir: Path, keep_work: bool = F
         try:
             from swf2card import SwfModel, matrix_from_xml, transform_bbox
             model = SwfModel(workdir / 'hot.xml')
+            btn_ids = []
             for el in model.tags:
                 cid = int(el.get('characterId') or 0)
-                if not ((el.get('type') or '').startswith('PlaceObject') and cid in model.buttons):
-                    continue
-                M = matrix_from_xml(el)
+                if (el.get('type') or '').startswith('PlaceObject') and cid in model.buttons \
+                        and cid not in btn_ids:
+                    btn_ids.append(cid)
+            btn_sounds = extract_button_sounds(swf, workdir / 'hot.xml', out)
+            over_map = extract_button_over_states(swf, workdir / 'hot.xml', workdir, out, btn_ids)
+            for cid in btn_ids:
+                M = matrix_from_xml(next(el for el in model.tags
+                                         if (el.get('type') or '').startswith('PlaceObject')
+                                         and el.get('characterId') == str(cid)))
                 bb = model.union_bounds(cid)
                 if not bb:
                     continue
@@ -578,20 +911,23 @@ def convert_animated(swf: Path, workdir: Path, outdir: Path, keep_work: bool = F
                 seg = label_to_seg.get(btn_map.get(str(cid), ''), None)
                 hotspots.append(dict(x=round(w[0]/20, 1), y=round(w[2]/20, 1),
                                      w=round((w[1]-w[0])/20, 1), h=round((w[3]-w[2])/20, 1),
-                                     seg=seg))
-            print(f"  热区: {[(h['x'], h['y'], h['seg']) for h in hotspots]}")
+                                     seg=seg,
+                                     snd=btn_sounds.get(str(cid)),
+                                     over=over_map.get(str(cid))))
+            print(f"  热区: {[(h['x'], h['y'], h['seg'], h.get('snd'), bool(h.get('over'))) for h in hotspots]}")
         except Exception as e:
-            print(f"  热区提取失败({e})")
+            import traceback; traceback.print_exc()
+            print(f"  热区/Over态提取失败({e})")
 
-    # 按钮点击音效
-    click_snd = export_click_sound(swf, out)
-
-    html = (ANIM_TMPL
+    tmpl = MP4_TMPL if use_mp4 else ANIM_TMPL
+    html = (tmpl
             .replace('__TITLE__', f'{name}')
             .replace('__W__', str(W))
             .replace('__H__', str(H))
             .replace('__FPS__', str(tl['fps']))
-            .replace('__FIRST_FRAME__', page_defs[0]['frames'][0] if page_defs and page_defs[0]['frames'] else '')
+            .replace('__FIRST_FRAME__',
+                     (page_defs[0]['frames'][0] if page_defs[0].get('frames')
+                      else page_defs[0].get('video', '')) if page_defs else '')
             .replace('__PAGES__', json.dumps(page_defs, ensure_ascii=False))
             .replace('__HOTSPOTS__', json.dumps(hotspots, ensure_ascii=False)))
     (out / f'{stem}.html').write_text(html, encoding='utf8')
@@ -610,19 +946,21 @@ def main():
                     help='按 Flash 翻页结构拆成多段(默认整条连播一条到底)')
     ap.add_argument('--anim', action='store_true',
                     help='忠实动画页模式: 每SWF一个独立H5(帧驱动动画+画面按钮热区+旁白)')
+    ap.add_argument('--mp4', action='store_true',
+                    help='mp4动画页模式: 页动画+旁白焊死成mp4(CRF16近无损, 体积小17倍), 热区/Over态/音效相同 — 批量分发用')
     ap.add_argument('--keep-work', action='store_true',
                     help='保留中间产物(帧PNG等,调试用;默认转完即删,防止批量时磁盘爆满)')
     ap.add_argument('-w', '--work', type=Path, default=Path('swf2video_work'),
                     help='中间产物目录 (默认 ./swf2video_work)')
     args = ap.parse_args()
 
-    if args.anim:
+    if args.anim or args.mp4:
         for swf in args.swfs:
             if not swf.exists():
                 print(f"跳过(不存在): {swf}"); continue
             try:
                 convert_animated(swf, args.work.resolve(), args.out.resolve(),
-                                 keep_work=args.keep_work)
+                                 keep_work=args.keep_work, use_mp4=args.mp4)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 print(f"✗ {swf}: {e}")
