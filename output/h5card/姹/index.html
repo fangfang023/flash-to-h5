@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>姹 · 汉字学习卡</title>
+<title>fg_top_34f916ff.png · 汉字学习卡</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
@@ -14,6 +14,12 @@
   .card img.bg { display:block; width:100%; }
   .anim { position:absolute; background-repeat:no-repeat; pointer-events:none;
           z-index:1; animation: play linear infinite; }
+  /* 前景遮挡层: SWF场景容器的前景shapes
+     fgMid(石子圈/水岸): 盖住荷叶根茎 — z1, DOM序在动画div之后故实际在上
+     fgTop(顶部装饰): 在水车等最深动画之上 — z1.5 */
+  .card img.fg { position:absolute; left:0; top:0; width:100%; pointer-events:none; }
+  .card img.fgMid { z-index:1; }
+  .card img.fgTop { z-index:2; }
   .hot { position:absolute; cursor:pointer; z-index:2; border-radius:50%;
          transition:transform .12s, filter .12s; }
   .hot:hover { transform:scale(1.07); filter:brightness(1.12); }
@@ -31,6 +37,9 @@
   <img class="bg" src="bg.png" alt="">
   <div class="panel" id="panel" style="z-index:3"><img id="panelImg" src="" alt=""></div>
   <div id="animLayer"></div>
+  <img class="fg fgMid" src="fg_mid_46a150dd.png" alt="">
+  <img class="fg fgTop" src="fg_top_34f916ff.png" alt="">
+
   <div class="hot" data-panel="panel_pinyin.png" style="left:20.1%;top:20.2%;width:7.0%;height:8.9%" title="pinyin"></div>
   <div class="hot" data-panel="panel_bushou.png" style="left:69.8%;top:22.0%;width:7.0%;height:8.9%" title="bushou"></div>
   <div class="hot" data-panel="panel_jiegou.png" style="left:14.5%;top:41.5%;width:13.1%;height:18.3%" title="jiegou"></div>
@@ -87,7 +96,7 @@ ANIMS.forEach(a => {
   } requestAnimationFrame(tick); }
   requestAnimationFrame(tick);
 });
-document.querySelector('img.bg').src = 'bg_clean_e26d5257.png';
+document.querySelector('img.bg').src = 'bg_clean_0bafeab7.png';
 const idx = ['pinyin','bushou','jiegou','ziyi','cixing','zuci'].indexOf(location.hash.slice(1));
 if (idx >= 0 && hots[idx]) hots[idx].click();
 </script>

@@ -355,9 +355,9 @@ def find_anim_sprites(workdir: Path):
     return None
 
 
-def make_clean_bg(swf: Path, tmp: Path, anim_ids: set) -> Path:
-    """XML回写法生成无动画元件的干净底图:
-    swf2xml -> 删除动画元件的PlaceObject -> xml2swf -> 渲染首帧"""
+def make_clean_bg(swf: Path, tmp: Path, anim_ids: set, fg_ranges: dict = None) -> Path:
+    """XML回写法生成无动画元件的干净底图(后景图):
+    swf2xml -> 删除动画PO + 前景PO(前景由前景层单独渲染叠加) -> xml2swf -> 渲染首帧"""
     import re as _re
     xml = tmp / 'card.xml'
     subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name, xml.resolve()],
@@ -368,6 +368,22 @@ def make_clean_bg(swf: Path, tmp: Path, anim_ids: set) -> Path:
         r'<item type="PlaceObject[23]Tag"[^>]*characterId="(' + ids_alt + r')"[^>]*>.*?</item>', _re.S)
     n = len(pat.findall(src))
     src = pat.sub('', src)
+    # 删除前景PO(mid+top两档, 避免底图里"印死"前景)
+    if fg_ranges:
+        import xml.etree.ElementTree as ET
+        tree = ET.fromstring(src)
+        for cont_id, (mid_start, top_start) in fg_ranges.items():
+            sp = next((el for el in tree.find('tags')
+                       if el.get('type') == 'DefineSpriteTag' and el.get('spriteId') == str(cont_id)), None)
+            if sp is None:
+                continue
+            sub = sp.find('subTags')
+            for el in list(sub):
+                if (el.get('type') or '').startswith('PlaceObject'):
+                    d = int(el.get('depth') or 0)
+                    if (mid_start is not None and d >= mid_start):
+                        sub.remove(el)
+        src = ET.tostring(tree, encoding='unicode')
     xml.write_text(src, encoding='utf8')
     clean_swf = tmp / 'card_clean.swf'
     subprocess.run(['java', '-jar', str(FFDEC), '-xml2swf', xml.name, clean_swf.resolve()],
@@ -375,8 +391,99 @@ def make_clean_bg(swf: Path, tmp: Path, anim_ids: set) -> Path:
     out = tmp / 'frames_clean'
     subprocess.run(['java', '-jar', str(FFDEC), '-export', 'frame', out.resolve(),
                     clean_swf.name], cwd=tmp, check=True, capture_output=True)
-    print(f"  干净底图: 已删除{n}条动画放置")
+    print(f"  干净底图: 已删除{n}条动画放置" +
+          (f" + 前景PO(depth>={min(v[0] for v in fg_ranges.values() if v[0])})" if fg_ranges else ""))
     return next(out.glob('*.png'))
+
+
+def make_foreground_layer(swf: Path, tmp: Path, container_ranges: dict) -> list:
+    """提取前景遮挡层(透明底PNG) — 修复荷叶根茎露出等层级问题。
+
+    SWF 场景容器(sprite34)的显示列表分三层:
+      后景 shapes(depth1-49: 池塘/水岸) / 动画实例(depth49-118) / 前景 shapes(depth74+)
+    SWF 渲染时前景盖住动画下部(荷叶根茎没入石子圈); H5 若只有"底图+动画"
+    两层, 动画永远盖住底图 → 前景被压到动画下面, 根茎露出来。
+
+    实现: 剪XML — 场景容器内只保留 depth >= 前景起始depth 的 PO,
+    主时间轴删除按钮/zmt → ignorebackground 渲染 → 裁剪为透明底PNG。
+    container_ranges: {spriteId: (mid_start, top_start)}
+      mid区间 [mid_start, top_start): 石子圈/水岸前景, 盖住荷叶根茎 — z在动画上
+      top区间 [top_start, ∞): 顶部装饰(云/屋顶), 在最深层动画(水车)之上 — z最高
+    返回 [mid图或None, top图或None]。
+    """
+    import xml.etree.ElementTree as ET
+    import shutil
+    xml_src = tmp / 'card.xml'
+    if not xml_src.exists():   # 独立生成(调用方可能尚未产出card.xml)
+        subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name, xml_src.resolve()],
+                       cwd=swf.parent, check=True, capture_output=True)
+    tree = ET.parse(xml_src)
+    root = tree.getroot()
+    tags = root.find('tags')
+    # 主时间轴: 删首帧所有PO + 后续帧(只渲染容器一层)
+    first_sf = next(i for i, el in enumerate(tags) if el.get('type') == 'ShowFrameTag')
+    main_pos = [el for el in list(tags)[:first_sf]
+                if (el.get('type') or '').startswith('PlaceObject')]
+    for el in main_pos:
+        tags.remove(el)
+    for el in list(tags)[first_sf:]:
+        tags.remove(el)
+    for el in list(tags):
+        if el.get('type') == 'ShowFrameTag':
+            tags.remove(el)
+    # 放回场景容器(sprite34)的PO, 容器内只留前景depth
+    keep_po = next((el for el in main_pos
+                    if el.get('characterId') and int(el.get('characterId')) in container_ranges), None)
+    if keep_po is None:
+        return None
+    tags.append(keep_po)
+    tags.append(ET.Element('item', {'type': 'ShowFrameTag'}))
+    import numpy as np
+    from PIL import Image
+
+    def render_range(lo: int, hi: int) -> 'Image | None':
+        """渲染容器内 depth∈[lo,hi) 的内容(hi=None→∞)"""
+        t2 = ET.parse(xml_src)
+        g2 = t2.getroot().find('tags')
+        sp2 = next(el for el in g2 if el.get('type') == 'DefineSpriteTag'
+                   and el.get('spriteId') == container_id)
+        sub2 = sp2.find('subTags')
+        removed = 0
+        for el in list(sub2):
+            if (el.get('type') or '').startswith('PlaceObject'):
+                d = int(el.get('depth') or 0)
+                if d < lo or (hi is not None and d >= hi):
+                    sub2.remove(el)
+                    removed += 1
+        xp = tmp / f'card_fg_{lo}.xml'
+        t2.write(xp, encoding='utf-8')
+        sp_ = tmp / f'card_fg_{lo}.swf'
+        r = subprocess.run(['java', '-jar', str(FFDEC), '-xml2swf',
+                            xp.name, sp_.resolve()], cwd=tmp, capture_output=True)
+        if r.returncode != 0:
+            return None
+        fr = tmp / f'frames_fg_{lo}'
+        subprocess.run(['java', '-jar', str(FFDEC), '-ignorebackground', '-export', 'frame',
+                        fr.resolve(), sp_.name], cwd=tmp, capture_output=True)
+        pngs = list(fr.glob('*.png'))
+        if not pngs:
+            return None
+        im = Image.open(pngs[0]).convert('RGBA')
+        a = np.array(im)[:, :, 3]
+        ys, xs = np.where(a > 10)
+        if not len(xs):
+            return None
+        print(f"  前景层[{lo},{hi if hi is not None else '∞'}): 保留, 删{removed}条区外放置")
+        shutil.rmtree(fr, ignore_errors=True)
+        sp_.unlink(missing_ok=True)
+        xp.unlink(missing_ok=True)
+        return im
+
+    container_id = keep_po.get('characterId')
+    mid_start, top_start = container_ranges[int(container_id)]
+    mid_img = render_range(mid_start, top_start)
+    top_img = render_range(top_start, None)
+    return [mid_img, top_img]
 
 
 def build_anim_layer(swf: Path, tmp: Path, out_dir: Path, fps: float, exclude: set = None):
@@ -877,7 +984,46 @@ def convert(swf: Path, outdir: Path):
                 print(f"  · {msg}")
         if sheet_names:
             anim_ids = set(sheet_names.keys())
-            clean_bg = make_clean_bg(swf, tmp, anim_ids)
+            # ===== 前景遮挡层分析(修复荷叶根茎露出等层级问题) =====
+            # 场景容器显示列表: 后景shapes / 动画实例 / 前景shapes。
+            # 动画区间之后仍有shape放置 → 说明有前景遮盖层, 需分层渲染。
+            fg_ranges = {}
+            for el in model.tags:
+                t = el.get('type') or ''
+                if t == 'ShowFrameTag':
+                    break
+                _cid_raw = el.get('characterId')
+                if t.startswith('PlaceObject') and _cid_raw \
+                        and int(_cid_raw) in model.sprites:
+                    cont_id = int(_cid_raw)
+                    anim_d = [int(c.get('depth')) for c in model.sprite_placements(cont_id)
+                              if c.get('characterId') and int(c.get('characterId')) in anim_ids]
+                    if not anim_d:
+                        continue
+                    anim_min, anim_max = min(anim_d), max(anim_d)
+                    # 非动画PO分两档:
+                    #   mid: depth > anim_min (石子圈等, 盖荷叶根茎; 在部分动画之上)
+                    #   top: depth > anim_max (在水车等最深动画之上: 顶部装饰)
+                    mid_start = top_start = None
+                    for c in model.sprite_placements(cont_id):
+                        d = int(c.get('depth') or 0)
+                        cid2 = int(c.get('characterId') or 0)
+                        if cid2 in anim_ids:
+                            continue
+                        if d > anim_max:
+                            if top_start is None or d < top_start:
+                                top_start = d
+                        elif d > anim_min:
+                            if mid_start is None or d < mid_start:
+                                mid_start = d
+                    if mid_start is not None or top_start is not None:
+                        fg_ranges[cont_id] = (mid_start, top_start)
+                        print(f"  场景容器sprite{cont_id}: 动画depth {anim_min}-{anim_max}, "
+                              f"前景mid从{mid_start}, top从{top_start}")
+                    break
+            # 先生成前景层(card.xml 原始版), 再生成干净底图(card.xml会被改写)
+            fg_imgs = make_foreground_layer(swf, tmp, fg_ranges) if fg_ranges else [None, None]
+            clean_bg = make_clean_bg(swf, tmp, anim_ids, fg_ranges)
             import hashlib as _hl
             h = _hl.md5(clean_bg.read_bytes()).hexdigest()[:8]
             (card_dir / f'bg_clean_{h}.png').write_bytes(clean_bg.read_bytes())
@@ -885,6 +1031,15 @@ def convert(swf: Path, outdir: Path):
             globals()['_ANIM_META'] = meta
             globals()['_SHEET_NAMES'] = sheet_names
             globals()['_FPS'] = fps
+            fg_pair = {}
+            for tag, im in (('mid', fg_imgs[0]), ('top', fg_imgs[1])):
+                if im is not None:
+                    fh = _hl.md5(im.tobytes()).hexdigest()[:8]
+                    name = f'fg_{tag}_{fh}.png'
+                    im.save(card_dir / name, optimize=True)
+                    fg_pair[tag] = name
+                    print(f"  ✓ 前景层{tag}: {name}")
+            globals()['_FG_PAIR'] = fg_pair
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -989,12 +1144,20 @@ def convert(swf: Path, outdir: Path):
             "  requestAnimationFrame(tick);\n"
             "});\n"
             "document.querySelector('img.bg').src = '" + clean_bg + "';")
+    # 前景遮挡层: 盖在动画之上(恢复SWF的"前景shapes盖住荷叶根茎"层级)
+    fg_pair = globals().get('_FG_PAIR') or {}
+    fg_html = ''
+    if 'mid' in fg_pair:
+        fg_html += f'  <img class="fg fgMid" src="{fg_pair["mid"]}" alt="">\n'
+    if 'top' in fg_pair:
+        fg_html += f'  <img class="fg fgTop" src="{fg_pair["top"]}" alt="">\n'
 
     html = HTML_TMPL.replace('__TITLE__', f'{name} · 汉字学习卡') \
                     .replace('__HOTS__', '\n'.join(hots)) \
                     .replace('__PANEL_STYLE__',
                              f'left:{panel_left:.2f}%;top:{panel_top:.2f}%;width:{panel_w:.2f}%') \
                     .replace('__AUDIO__', audio_html) \
+                    .replace('__FG_LAYER__', fg_html) \
                     .replace('__ANIM_LAYER__', anim_js)
     (card_dir / 'index.html').write_text(html, encoding='utf8')
     # anims.json 也同步一份(调试/验收用)
@@ -1030,6 +1193,12 @@ HTML_TMPL = """<!DOCTYPE html>
   .card img.bg { display:block; width:100%; }
   .anim { position:absolute; background-repeat:no-repeat; pointer-events:none;
           z-index:1; animation: play linear infinite; }
+  /* 前景遮挡层: SWF场景容器的前景shapes
+     fgMid(石子圈/水岸): 盖住荷叶根茎 — z1, DOM序在动画div之后故实际在上
+     fgTop(顶部装饰): 在水车等最深动画之上 — z1.5 */
+  .card img.fg { position:absolute; left:0; top:0; width:100%; pointer-events:none; }
+  .card img.fgMid { z-index:1; }
+  .card img.fgTop { z-index:2; }
   .hot { position:absolute; cursor:pointer; z-index:2; border-radius:50%;
          transition:transform .12s, filter .12s; }
   .hot:hover { transform:scale(1.07); filter:brightness(1.12); }
@@ -1047,6 +1216,7 @@ HTML_TMPL = """<!DOCTYPE html>
   <img class="bg" src="bg.png" alt="">
   <div class="panel" id="panel" style="z-index:3"><img id="panelImg" src="" alt=""></div>
   <div id="animLayer"></div>
+__FG_LAYER__
 __HOTS__
 </div>
 <div class="btnbar">
