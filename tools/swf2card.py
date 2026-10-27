@@ -355,19 +355,252 @@ def find_anim_sprites(workdir: Path):
     return None
 
 
-def make_clean_bg(swf: Path, tmp: Path, anim_ids: set, fg_ranges: dict = None) -> Path:
+def extract_button_states(swf: Path, model: 'SwfModel', tmp: Path, card_dir: Path,
+                          btn_ids: set) -> dict:
+    """提取六按钮三态素材(2026-10-27 按钮三态交互补全)。
+
+    数据形态(已核实, 姹/嫣同构同 cid):
+      bt1=btn50/bt2=btn48: Up=Over=Down = sprite46(35帧GLOWFILTER呼吸, blur 10→30→10)
+                           + 静态本体(cid49/47 蘑菇)。无需 hover 切换, 只需发光循环。
+      bt3=btn55: Up=cid51+52+53(木屋静态), Over=sprite54(5帧开门: 门宽1→0.35透视)
+      bt4=btn59: Up=cid56, Over=cid58(发光球, 静态)
+      bt5=btn43: Up=cid40, Over=cid42(单帧sprite容器→cid41, scale 1.03)
+      bt6=btn39: Up=cid35, Over=cid37(单帧sprite容器→cid36, scale 1.03)
+
+    产物(card_dir/btn/):
+      up_<btnId>.png      Up 态合成图(全部Up记录按矩形并集直接贴, 不做层级混合)
+      over_<btnId>.png    Over 态合成图(同上)
+      glow_<btnId>.png    Up 态多帧 sprite 的帧序列 sheet(仅发光按钮有)
+      door_<btnId>.png    Over 态多帧 sprite 的 sheet(仅开门按钮有)
+    返回 {btnId: {up, over, glow, door, rect_up, rect_over, glow_anim: bool}}
+    矩形为舞台 px: 主时间轴放置矩阵 ∘ BUTTONRECORD placeMatrix × 内容bounds。"""
+    import hashlib
+    import shutil
+    from PIL import Image
+    btn_dir = card_dir / 'btn'
+    btn_dir.mkdir(exist_ok=True)
+    out = {}
+    # 1. 主时间轴按钮放置全矩阵
+    bt_M = {}
+    for el in model.tags:
+        t = el.get('type') or ''
+        if t == 'ShowFrameTag':
+            break
+        if t.startswith('PlaceObject') and el.get('name') in {f'bt{i}' for i in range(1, 10)}:
+            bt_M[int(el.get('characterId') or 0)] = matrix_from_xml(el)
+    # 2. 三态 BUTTONRECORD(带状态位, model.buttons 只有 (cid,M) 不带状态)
+    import xml.etree.ElementTree as ET
+    states_by_btn = {}   # btnId -> {state: [(cid, M)]}
+    for it in model.tags:
+        if (it.get('type') or '') in ('DefineButtonTag', 'DefineButton2Tag'):
+            bid = int(it.get('buttonId'))
+            if bid not in btn_ids:
+                continue
+            groups = {'up': [], 'over': [], 'down': []}
+            for r in it.iter('item'):
+                if r.get('type') != 'BUTTONRECORD':
+                    continue
+                pm = next((m for m in r.iter() if m.get('type') == 'MATRIX'), None)
+                M = (1.0, 0.0, 0.0, 1.0, 0, 0) if pm is None else matrix_from_xml(r)
+                for st, attr in (('up', 'buttonStateUp'), ('over', 'buttonStateOver'),
+                                 ('down', 'buttonStateDown')):
+                    if r.get(attr) == 'true':
+                        groups[st].append((int(r.get('characterId') or 0), M))
+            states_by_btn[bid] = groups
+    # 3. 素材源: 静态 shape 用 JPEXS -selectid 导出; sprite 帧用已导出的 tmp/sprites
+    shape_ids = {cid for g in states_by_btn.values() for recs in g.values()
+                 for cid, _ in recs if cid in model.char_bounds}
+    shape_src = {}
+    if shape_ids:
+        sh_dir = tmp / 'btn_shapes'
+        subprocess.run(['java', '-jar', str(FFDEC), '-selectid',
+                        ','.join(str(s) for s in sorted(shape_ids)),
+                        '-format', 'shape:png', '-export', 'shape',
+                        sh_dir.resolve(), swf.name],
+                       cwd=swf.parent, check=True, capture_output=True)
+        for f in sh_dir.glob('*.png'):
+            shape_src[int(f.stem)] = f
+    # 4. 逐按钮组装
+    for bid, groups in sorted(states_by_btn.items()):
+        rec = dict(btn_id=bid)
+        M_main = bt_M.get(bid)
+        if M_main is None:
+            continue
+        # Over == Down 时只按 Over 处理(本卡族全部如此)
+        if sorted(groups['down']) == sorted(groups['over']):
+            groups['down'] = []
+        anim_recs = []   # Up 态多帧 sprite(btn txt 分离时引用)
+        for st, recs in groups.items():
+            if not recs:
+                continue
+            # 世界矩形(并集)
+            rects = []
+            for cid, pm in recs:
+                bb = model.char_bounds.get(cid) or model.union_bounds(cid)
+                if bb:
+                    rects.append(transform_bbox(mul_m(M_main, pm), bb))
+            if not rects:
+                continue
+            u = (min(r[0] for r in rects), max(r[1] for r in rects),
+                 min(r[2] for r in rects), max(r[3] for r in rects))
+            rec[f'rect_{st}'] = dict(x=round(u[0] / 20, 1), y=round(u[2] / 20, 1),
+                                     w=round((u[1] - u[0]) / 20, 1),
+                                     h=round((u[3] - u[2]) / 20, 1))
+            # 多帧 sprite(动画态): 帧 sheet; 单帧合成: 贴 canvas
+            anim_recs = [(cid, pm) for cid, pm in recs
+                         if cid in model.sprites and model._sprite_frame_count(cid) > 1]
+            if st == 'up':
+                anim_recs_up = [c for c, _ in anim_recs]
+            if anim_recs and st in ('up', 'over'):
+                cid, pm = anim_recs[0]
+                # bt1/bt2(拼音/部首): Up=Over=Down 同一 sprite46 — Over 与 Up
+                # 同一多帧sprite时只算 glow, 不重复产 door(hover 不切换)
+                if st == 'over' and cid in anim_recs_up:
+                    continue
+                fc = model._sprite_frame_count(cid)
+                frames = []
+                d = tmp / 'sprites' / f'DefineSprite_{cid}'
+                for i in range(1, fc + 1):
+                    f = d / f'{i}.png'
+                    if f.exists():
+                        frames.append(Image.open(f).convert('RGBA'))
+                if len(frames) >= 2:
+                    cols = min(10, len(frames))
+                    rows = (len(frames) + cols - 1) // cols
+                    fw = max(im.width for im in frames)
+                    fh = max(im.height for im in frames)
+                    sheet = Image.new('RGBA', (fw * cols, fh * rows), (0, 0, 0, 0))
+                    for i, im in enumerate(frames):
+                        sheet.paste(im, ((i % cols) * fw, (i // cols) * fh), im)
+                    kind = 'glow' if st == 'up' else 'door'
+                    hsh = hashlib.md5(sheet.tobytes()).hexdigest()[:8]
+                    name = f'{kind}_{bid}_{hsh}.png'
+                    sheet.save(btn_dir / name, optimize=True)
+                    bb = model.char_bounds.get(cid) or model.union_bounds(cid)
+                    wb = transform_bbox(mul_m(M_main, pm), bb)
+                    rec[kind] = dict(
+                        img=f'btn/{name}', n=len(frames), cols=cols, rows=rows,
+                        dur=round(len(frames) / 25.0, 3),
+                        x=round(wb[0] / 20, 1), y=round(wb[2] / 20, 1),
+                        w=round((wb[1] - wb[0]) / 20, 1), h=round((wb[3] - wb[2]) / 20, 1))
+                    continue   # 动画态不生成静态合成图
+            # 静态合成: 各记录的导出图贴到"该记录自身世界矩形"位置(等比, 无旋转情形)
+            Wpx, Hpx = int(u[1] / 20 - u[0] / 20 + 0.5), int(u[3] / 20 - u[2] / 20 + 0.5)
+            canvas = Image.new('RGBA', (max(1, Wpx), max(1, Hpx)), (0, 0, 0, 0))
+            for cid, pm in recs:
+                src = shape_src.get(cid)
+                if cid in model.sprites:
+                    d = tmp / 'sprites' / f'DefineSprite_{cid}'
+                    f1 = d / '1.png'
+                    src = f1 if f1.exists() else src
+                if src is None:
+                    continue
+                im = Image.open(src).convert('RGBA')
+                bb = model.char_bounds.get(cid) or model.union_bounds(cid)
+                if not bb:
+                    continue
+                wb = transform_bbox(mul_m(M_main, pm), bb)
+                x = int(round((wb[0] - u[0]) / 20))
+                y = int(round((wb[2] - u[2]) / 20))
+                w = max(1, int(round((wb[1] - wb[0]) / 20)))
+                h = max(1, int(round((wb[3] - wb[2]) / 20)))
+                if abs(im.width - w) > 1 or abs(im.height - h) > 1:
+                    im = im.resize((w, h), Image.LANCZOS)
+                canvas.paste(im, (x, y), im)
+            hsh = hashlib.md5(canvas.tobytes()).hexdigest()[:8]
+            name = f'{st}_{bid}_{hsh}.png'
+            canvas.save(btn_dir / name, optimize=True)
+            rec[f'{st}_img'] = f'btn/{name}'
+        out[bid] = rec
+        # 发光按钮(Up=Over=同一多帧sprite, 如 bt1/bt2 的 sprite46): glow 动画层
+        # 是不透明球体帧, 会盖住底图上的文字牌(cid49/47, BUTTONRECORD depth 更高,
+        # 原片文字在球之上) — 把静态记录单独产出 txt_<bid>.png 供 JS 叠在 glow 上
+        if rec.get('glow'):
+            static_recs = [(cid, pm) for cid, pm in groups['up']
+                           if cid not in dict(anim_recs)]
+            rects2 = []
+            for cid, pm in static_recs:
+                bb = model.char_bounds.get(cid) or model.union_bounds(cid)
+                if bb:
+                    rects2.append(transform_bbox(mul_m(M_main, pm), bb))
+            if static_recs and rects2:
+                u2 = (min(r[0] for r in rects2), max(r[1] for r in rects2),
+                      min(r[2] for r in rects2), max(r[3] for r in rects2))
+                Wpx = int(u2[1] / 20 - u2[0] / 20 + 0.5)
+                Hpx = int(u2[3] / 20 - u2[2] / 20 + 0.5)
+                canvas = Image.new('RGBA', (max(1, Wpx), max(1, Hpx)), (0, 0, 0, 0))
+                for cid, pm in static_recs:
+                    src = shape_src.get(cid)
+                    if src is None:
+                        continue
+                    im = Image.open(src).convert('RGBA')
+                    bb = model.char_bounds.get(cid) or model.union_bounds(cid)
+                    wb = transform_bbox(mul_m(M_main, pm), bb)
+                    x = int(round((wb[0] - u2[0]) / 20))
+                    y = int(round((wb[2] - u2[2]) / 20))
+                    w = max(1, int(round((wb[1] - wb[0]) / 20)))
+                    h = max(1, int(round((wb[3] - wb[2]) / 20)))
+                    if abs(im.width - w) > 1 or abs(im.height - h) > 1:
+                        im = im.resize((w, h), Image.LANCZOS)
+                    canvas.paste(im, (x, y), im)
+                hsh = hashlib.md5(canvas.tobytes()).hexdigest()[:8]
+                name = f'txt_{bid}_{hsh}.png'
+                canvas.save(btn_dir / name, optimize=True)
+                rec['txt'] = dict(img=f'btn/{name}',
+                                  x=round(u2[0] / 20, 1), y=round(u2[2] / 20, 1),
+                                  w=round((u2[1] - u2[0]) / 20, 1),
+                                  h=round((u2[3] - u2[2]) / 20, 1))
+                parts = [f"txt={name}"]
+        parts = []
+        for st in ('up', 'over'):
+            if f'{st}_img' in rec:
+                parts.append(f"{st}={rec[f'{st}_img']}")
+            if st in ('up', 'over') and st in rec and isinstance(rec.get(st), dict):
+                parts.append(f"{st}_anim×{rec[st]['n']}")
+        if rec.get('txt'):
+            parts.append(f"txt={rec['txt']['img']}")
+        print(f"  按钮{bid}: {' '.join(parts) or '无素材'}")
+    return out
+
+
+def make_clean_bg(swf: Path, tmp: Path, anim_ids: set, fg_ranges: dict = None,
+                  extra_exclude: set = None) -> Path:
     """XML回写法生成无动画元件的干净底图(后景图):
-    swf2xml -> 删除动画PO + 前景PO(前景由前景层单独渲染叠加) -> xml2swf -> 渲染首帧"""
+    swf2xml -> 删除动画PO + 前景PO(前景由前景层单独渲染叠加) -> xml2swf -> 渲染首帧。
+    extra_exclude: 追加删除的 characterId(如按钮 Up 态里的发光 sprite46 —
+    底图不能印死静止光晕, 否则动画层再叠会重影)。"""
     import re as _re
     xml = tmp / 'card.xml'
     subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name, xml.resolve()],
                    cwd=swf.parent, check=True, capture_output=True)
     src = xml.read_text(encoding='utf8')
-    ids_alt = '|'.join(str(i) for i in anim_ids)
+    all_ids = set(anim_ids) | set(extra_exclude or set())
+    ids_alt = '|'.join(str(i) for i in all_ids)
     pat = _re.compile(
         r'<item type="PlaceObject[23]Tag"[^>]*characterId="(' + ids_alt + r')"[^>]*>.*?</item>', _re.S)
     n = len(pat.findall(src))
     src = pat.sub('', src)
+    # 按钮内发光 sprite(如 sprite46)不走 PlaceObject — 以 BUTTONRECORD 形式
+    # 挂在 DefineButton2 的 characters 里。直接删 BUTTONRECORD 会让 JPEXS 渲染
+    # 时整个按钮消失(已踩坑: 剪按钮记录后渲染不可靠)。改为清空 sprite 定义
+    # 内部的全部 PlaceObject(球体+光晕都来自 sprite 内部), 按钮结构与文字牌
+    # (cid49 等)保留 — 动态版由 H5 的 glow 动画层贴回。
+    if extra_exclude:
+        import xml.etree.ElementTree as ET
+        tree = ET.fromstring(src)
+        nb = 0
+        for it in tree.find('tags'):
+            if it.get('type') == 'DefineSpriteTag' \
+                    and int(it.get('spriteId') or 0) in extra_exclude:
+                sub = it.find('subTags')
+                if sub is None:
+                    continue
+                for el in list(sub):
+                    if (el.get('type') or '').startswith('PlaceObject'):
+                        sub.remove(el)
+                        nb += 1
+        src = ET.tostring(tree, encoding='unicode')
+        n += nb
     # 删除前景PO(mid+top两档, 避免底图里"印死"前景)
     if fg_ranges:
         import xml.etree.ElementTree as ET
@@ -1041,7 +1274,20 @@ def convert(swf: Path, outdir: Path):
                     break
             # 先生成前景层(card.xml 原始版), 再生成干净底图(card.xml会被改写)
             fg_imgs = make_foreground_layer(swf, tmp, fg_ranges) if fg_ranges else [None, None]
-            clean_bg = make_clean_bg(swf, tmp, anim_ids, fg_ranges)
+            # 底图抠洞: 按钮 Up 态里的多帧发光 sprite(如 sprite46)内部 PO 清空,
+            # 否则底图印着静止光晕球体, 动画层再叠会重影。
+            # (sprite46 = 球体+GLOWFILTER 逐帧呼吸, 球体本身也在动画层里;
+            #  文字牌 cid49 等单帧记录不受影响, 保留在底图)
+            glow_ids = set()
+            for bid, recs in model.buttons.items():
+                for cid, _pm in recs:
+                    if cid in model.sprites and model._sprite_frame_count(cid) > 1 \
+                            and cid not in anim_ids:
+                        glow_ids.add(cid)
+            if glow_ids:
+                print(f"  底图抠洞: 清空按钮发光sprite定义 {sorted(glow_ids)}")
+            clean_bg = make_clean_bg(swf, tmp, anim_ids, fg_ranges,
+                                     extra_exclude=glow_ids)
             import hashlib as _hl
             h = _hl.md5(clean_bg.read_bytes()).hexdigest()[:8]
             (card_dir / f'bg_clean_{h}.png').write_bytes(clean_bg.read_bytes())
@@ -1094,6 +1340,15 @@ def convert(swf: Path, outdir: Path):
         audio_html = '<audio id="narr" src="narrate.mp3" preload="auto"></audio>'
 
     # 7. 生成 HTML(热区 = 按钮元件bounds × 世界矩阵, 不再写死14%x13%)
+    # 7a. 按钮三态素材(发光循环/开门/hover换图) — 失败不阻断主流程
+    btn_states = {}
+    try:
+        btn_states = extract_button_states(swf, model, tmp, card_dir, set(model.buttons))
+        globals()['_BTN_STATES'] = btn_states
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  按钮三态提取跳过({e})")
     hots = []
     for bt in sorted(bmap, key=lambda b: int(b[2:])):
         n = int(bt[2:]) - 1
@@ -1120,6 +1375,36 @@ def convert(swf: Path, outdir: Path):
     panel_left = px / W * 100
     panel_top = py / H * 100
     panel_w = probe_w / W * 100
+
+    # 按钮三态JS: bt名(热区序) ↔ buttonId 对齐后下发给前端
+    btn_js = ''
+    btn_states = globals().get('_BTN_STATES') or {}
+    if btn_states:
+        import json as _bj
+        js_btns = []
+        for i, bt in enumerate(sorted(bmap, key=lambda b: int(b[2:]))):
+            bid = named.get(bt, (0, 0, 0))[0]
+            rec = btn_states.get(bid)
+            if not rec:
+                continue
+            entry = dict(idx=i)
+            for key in ('glow', 'door'):   # 动画 sheet: 帧序列字段
+                if isinstance(rec.get(key), dict):
+                    entry[key] = {k2: rec[key][k2] for k2 in
+                                  ('img', 'n', 'cols', 'rows', 'dur', 'x', 'y', 'w', 'h')}
+            if isinstance(rec.get('txt'), dict):   # 静态文字牌: 仅矩形+图
+                entry['txt'] = {k2: rec['txt'][k2] for k2 in ('img', 'x', 'y', 'w', 'h')}
+            for key in ('up_img', 'over_img'):
+                if rec.get(key):
+                    entry[key] = rec[key]
+            if 'over_img' in entry or 'door' in entry:
+                entry['rect_over'] = rec.get('rect_over')
+            if len(entry) > 1:   # idx 之外任一素材(glow/door/up/over)即下发
+                js_btns.append(entry)
+        if js_btns:
+            btn_js = (
+                "const BTN_W = " + f"{W:.0f}" + ", BTN_H = " + f"{H:.0f}" + ";\n"
+                "const BTNS = " + _bj.dumps(js_btns, ensure_ascii=False) + ";\n" + BTN_STATE_JS)
 
     # 动画层JS(若有) — 实例清单版: 每实例自带sheet信息(旋转实例为预烘焙sheet)
     anim_js = ''
@@ -1204,7 +1489,8 @@ def convert(swf: Path, outdir: Path):
                     .replace('__FG_LAYER__', fg_html) \
                     .replace('__SWAY_JS__', sway_js) \
                     .replace('__DEFAULT_PANEL__', 'panel_default.png') \
-                    .replace('__ANIM_LAYER__', anim_js)
+                    .replace('__ANIM_LAYER__', anim_js) \
+                    .replace('__BTN_STATES__', btn_js)
     (card_dir / 'index.html').write_text(html, encoding='utf8')
     # anims.json 也同步一份(调试/验收用)
     if inst_recs:
@@ -1221,6 +1507,95 @@ def convert(swf: Path, outdir: Path):
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"  ✓ 输出: {card_dir}/")
+
+
+BTN_STATE_JS = """(function(){
+  const layer = document.querySelector('.card');
+  function mkDiv(b, x, y, w, h){
+    const d = document.createElement('div');
+    d.style.cssText = `position:absolute;pointer-events:none;background-repeat:no-repeat;`+
+      `left:${x/BTN_W*100}%;top:${y/BTN_H*100}%;width:${w/BTN_W*100}%;height:${h/BTN_H*100}%;`;
+    layer.appendChild(d); return d;
+  }
+  function sizeBg(d, cols, rows){
+    const r = d.getBoundingClientRect();
+    if (r.width > 0) d.style.backgroundSize = `${r.width*cols}px ${r.height*rows}px`;
+  }
+  BTNS.forEach(b => {
+    const hot = hots[b.idx]; if (!hot) return;
+    // 1) 发光循环层(拼音/部首: sprite46 35帧, 常驻Up态)
+    if (b.glow) {
+      const d = mkDiv(b.glow, b.glow.x, b.glow.y, b.glow.w, b.glow.h);
+      d.style.backgroundImage = `url(${b.glow.img})`;
+      d.style.zIndex = 2;
+      hot.parentNode.insertBefore(d, hot);   // 热区之下, 不挡点击
+      const g = b.glow; let f = 0, last = performance.now();
+      const fd = g.dur*1000/g.n;
+      (function tick(now){
+        if (now - last >= fd) {
+          f = (f + Math.floor((now-last)/fd)) % g.n; last = now;
+          const r = d.getBoundingClientRect();
+          d.style.backgroundSize = `${r.width*g.cols}px ${r.height*g.rows}px`;
+          d.style.backgroundPosition = `${-(f%g.cols)*r.width}px ${-Math.floor(f/g.cols)*r.height}px`;
+        }
+        requestAnimationFrame(tick);
+      })(performance.now());
+      b._glowDiv = d;
+    }
+    // 1b) 文字牌层(原片 BUTTONRECORD depth 在发光 sprite 之上)
+    if (b.txt) {
+      const t = mkDiv(b.txt, b.txt.x, b.txt.y, b.txt.w, b.txt.h);
+      t.style.backgroundImage = `url(${b.txt.img})`;
+      t.style.zIndex = 2;
+      hot.parentNode.insertBefore(t, hot);
+    }
+    // 2) Over 态(hover 换图/开门)
+    if (b.over_img || b.door) {
+      const ro = b.rect_over;
+      const d = mkDiv(b, ro.x, ro.y, ro.w, ro.h);
+      d.style.display = 'none';
+      d.style.zIndex = 3;   // 盖住热区Up态(发光圈之下? 原片Over含发光本体, 直接盖上)
+      layer.appendChild(d);
+      if (b.over_img) d.style.backgroundImage = `url(${b.over_img})`;
+      if (b.door) {
+        d.style.backgroundImage = `url(${b.door.img})`;
+        sizeBg(d, b.door.cols, b.door.rows);
+        d.style.backgroundPosition = '0px 0px';
+      }
+      b._overDiv = d;
+      // 开门小状态机: hover→帧1..5顺序播完停, 离开→立即回Up; 播放中重复hover不重启
+      let playing = false;
+      const doorPlay = () => {
+        if (playing || !b.door) return;
+        playing = true;
+        const g = b.door; let f = 0;
+        const fd = Math.max(24, g.dur*1000/g.n);   // 每帧至少24ms, 5帧开门≈0.2s
+        let last = performance.now();
+        (function tick(now){
+          if (now - last >= fd) {
+            f = Math.min(f + Math.floor((now-last)/fd), g.n - 1); last = now;
+            const r2 = d.getBoundingClientRect();
+            d.style.backgroundPosition = `${-(f%g.cols)*r2.width}px ${-Math.floor(f/g.cols)*r2.height}px`;
+            if (f >= g.n - 1) { playing = false; return; }
+          }
+          if (d.style.display !== 'none' && playing) requestAnimationFrame(tick);
+          else playing = false;
+        })(performance.now());
+      };
+      hot.addEventListener('mouseenter', () => {
+        d.style.display = 'block';
+        if (b.glow && b._glowDiv) b._glowDiv.style.opacity = '0';
+        doorPlay();
+      });
+      hot.addEventListener('mouseleave', () => {
+        d.style.display = 'none';
+        if (b.glow && b._glowDiv) b._glowDiv.style.opacity = '1';
+        playing = false;
+      });
+    }
+  });
+})();
+"""
 
 
 HTML_TMPL = """<!DOCTYPE html>
@@ -1291,6 +1666,8 @@ document.getElementById('reset').onclick = () => {
 if (narr) narr.play().catch(() => {});
 // ===== 装饰动画层(自动生成) =====
 __ANIM_LAYER__
+// ===== 按钮三态(Up发光循环 / Over换图 / 开门动画) =====
+__BTN_STATES__
 // ===== 面板容器摇摆(zmt时间轴逐帧tx, 还原云的左右摆动) =====
 __SWAY_JS__
 const idx = ['pinyin','bushou','jiegou','ziyi','cixing','zuci'].indexOf(location.hash.slice(1));
