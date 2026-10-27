@@ -57,7 +57,8 @@
 const narr = document.getElementById('narr');
 const panelImg = document.getElementById('panelImg');
 const hots = document.querySelectorAll('.hot');
-panelImg.parentElement.style.display = 'none';
+panelImg.parentElement.style.display = 'block';   // 原片打开即显示面板帧1(黑板+云)
+panelImg.src = 'panel_default.png';
 hots.forEach(h => h.addEventListener('click', () => {
   hots.forEach(x => x.classList.remove('active'));
   h.classList.add('active');
@@ -97,6 +98,21 @@ ANIMS.forEach(a => {
   requestAnimationFrame(tick);
 });
 document.querySelector('img.bg').src = 'bg_clean_0bafeab7.png';
+// ===== 面板容器摇摆(zmt时间轴逐帧tx, 还原云的左右摆动) =====
+const SWAY = {"n": 50, "amp": 12.0, "period": 2.0, "seq": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0, 11.5, 11.05, 10.55, 10.1, 9.6, 9.1, 8.65, 8.15, 7.7, 7.2, 6.7, 6.25, 5.75, 5.3, 4.8, 4.3, 3.85, 3.35, 2.9, 2.4, 1.9, 1.45, 0.95, 0.5, 0.0]};
+const panelBox = document.getElementById('panel');
+(function(){
+  let f = 0, last = performance.now();
+  const fd = SWAY.period * 1000 / SWAY.n;
+  function tick(now){
+    if (now - last >= fd) {
+      f = (f + Math.floor((now-last)/fd)) % SWAY.n; last = now;
+      panelBox.style.transform = `translateX(${SWAY.seq[f] - SWAY.seq[0]}px)`;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
 const idx = ['pinyin','bushou','jiegou','ziyi','cixing','zuci'].indexOf(location.hash.slice(1));
 if (idx >= 0 && hots[idx]) hots[idx].click();
 </script>

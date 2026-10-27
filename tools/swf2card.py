@@ -960,6 +960,24 @@ def convert(swf: Path, outdir: Path):
     probe_w = (pbb[1] - pbb[0]) / 20
     print(f"  面板位置(矩阵): ({px:.1f},{py:.1f}) 宽{probe_w:.1f}px")
 
+    # zmt 容器摇摆动画: zmt 时间轴逐帧 move 面板层(tx) — 姹/嫣实测为三角波
+    # (tx 85→325→85, 周期50帧=2s, 摆幅12px) — 云(面板背景)左右摇摆的来源
+    zmt_depth1_tx = []
+    for el in model.sprite_placements(zmt_id):
+        if el.get('depth') == '1':
+            mx = next((m for m in el.iter() if m.get('type') == 'MATRIX'), None)
+            if mx is not None:
+                zmt_depth1_tx.append(int(mx.get('translateX') or 0))
+    sway = None
+    if len(zmt_depth1_tx) >= 4:
+        lo, hi = min(zmt_depth1_tx), max(zmt_depth1_tx)
+        if hi - lo > 20:   # 摆幅>1px 才算摇摆动画
+            sway = dict(n=len(zmt_depth1_tx), amp=round((hi - lo) / 20, 2),
+                        period=round(len(zmt_depth1_tx) / 25.0, 3),
+                        seq=[round((t - lo) / 20, 2) for t in zmt_depth1_tx])
+            print(f"  面板摇摆: {sway['n']}帧 周期{sway['period']}s 摆幅{sway['amp']}px")
+    globals()['_PANEL_SWAY'] = sway
+
     # 6. 整理素材(底图=干净版: 删除动画元件的放置后重渲染; 动画层由JS叠加)
     try:
         import struct as _st
@@ -1051,6 +1069,8 @@ def convert(swf: Path, outdir: Path):
         n = int(bt[2:]) - 1
         lab = labels[n] if n < len(labels) else f'panel{n}'
         (card_dir / f'panel_{lab}.png').write_bytes(panels[k-1].read_bytes())
+    # 默认面板 = zm帧1(原片打开时的黑板+云状态)
+    (card_dir / 'panel_default.png').write_bytes(panels[0].read_bytes())
     # 首帧背景里已含面板1状态 -> 面板1(默认)通常=panels[0]
 
     # 音频: 自动播放的长音轨(-1.wav/-1.mp3)转mp3; 无流式轨时选最大的具名mp3(如72.mp3讲解)
@@ -1152,12 +1172,38 @@ def convert(swf: Path, outdir: Path):
     if 'top' in fg_pair:
         fg_html += f'  <img class="fg fgTop" src="{fg_pair["top"]}" alt="">\n'
 
+    # 面板摇摆动画JS(忠实zmt时间轴的tx序列)
+    sway = globals().get('_PANEL_SWAY')
+    sway_js = ''
+    if sway:
+        import json as _sj
+        sway_js = (
+            "const SWAY = " + _sj.dumps(sway) + ";\n"
+            "const panelBox = document.getElementById('panel');\n"
+            "(function(){\n"
+            "  let f = 0, last = performance.now();\n"
+            "  const fd = SWAY.period * 1000 / SWAY.n;\n"
+            "  function tick(now){\n"
+            "    if (now - last >= fd) {\n"
+            "      f = (f + Math.floor((now-last)/fd)) % SWAY.n; last = now;\n"
+            "      panelBox.style.transform = `translateX(${SWAY.seq[f] - SWAY.seq[0]}px)`;\n"
+            "    }\n"
+            "    requestAnimationFrame(tick);\n"
+            "  }\n"
+            "  requestAnimationFrame(tick);\n"
+            "})();")
+    # 默认面板 = 原片首帧的面板状态(zm帧1; AS映射的面板从帧2起)
+    default_panel = hots[0].split('data-panel="')[1].split('"')[0] if hots else ''
+    # bmap映射的是gotoAndStop(k)的面板帧; 首帧显示的是zm时间轴第1帧 = 未点击状态
+    # 用 panels[0](zm的帧1)
     html = HTML_TMPL.replace('__TITLE__', f'{name} · 汉字学习卡') \
                     .replace('__HOTS__', '\n'.join(hots)) \
                     .replace('__PANEL_STYLE__',
                              f'left:{panel_left:.2f}%;top:{panel_top:.2f}%;width:{panel_w:.2f}%') \
                     .replace('__AUDIO__', audio_html) \
                     .replace('__FG_LAYER__', fg_html) \
+                    .replace('__SWAY_JS__', sway_js) \
+                    .replace('__DEFAULT_PANEL__', 'panel_default.png') \
                     .replace('__ANIM_LAYER__', anim_js)
     (card_dir / 'index.html').write_text(html, encoding='utf8')
     # anims.json 也同步一份(调试/验收用)
@@ -1229,7 +1275,8 @@ __AUDIO__
 const narr = document.getElementById('narr');
 const panelImg = document.getElementById('panelImg');
 const hots = document.querySelectorAll('.hot');
-panelImg.parentElement.style.display = 'none';
+panelImg.parentElement.style.display = 'block';   // 原片打开即显示面板帧1(黑板+云)
+panelImg.src = '__DEFAULT_PANEL__';
 hots.forEach(h => h.addEventListener('click', () => {
   hots.forEach(x => x.classList.remove('active'));
   h.classList.add('active');
@@ -1244,6 +1291,8 @@ document.getElementById('reset').onclick = () => {
 if (narr) narr.play().catch(() => {});
 // ===== 装饰动画层(自动生成) =====
 __ANIM_LAYER__
+// ===== 面板容器摇摆(zmt时间轴逐帧tx, 还原云的左右摆动) =====
+__SWAY_JS__
 const idx = ['pinyin','bushou','jiegou','ziyi','cixing','zuci'].indexOf(location.hash.slice(1));
 if (idx >= 0 && hots[idx]) hots[idx].click();
 </script>
