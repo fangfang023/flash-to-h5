@@ -15,13 +15,22 @@ output/
 └── swf-player/    Ruffle 兜底播放器(疑难文件用)
 ```
 
-## swf2video.py — 分页/线性课件 → 整条 MP4
+## swf2video.py — 分页/线性课件 → H5
 
 ```bash
-python3 tools/swf2video.py a.swf b.swf -o output/xxx     # 默认整条连播
-python3 tools/swf2video.py a.swf --paged -o output/xxx   # 按原Flash翻页结构拆段
+python3 tools/swf2video.py a.swf b.swf -o output/xxx     # 默认整条连播(纯线性SWF用)
+python3 tools/swf2video.py a.swf --paged -o output/xxx   # 分页mp4模式(弃用,被--anim取代)
+python3 tools/swf2video.py a.swf --anim -o output/xxx    # 忠实动画页模式(交互课件用)
 python3 tools/swf2video.py a.swf --keep-work -o out      # 保留中间产物(调试)
 ```
+
+**--anim 动画页模式(2026-10-27 新增, 交互课件的默认形态)**: 每个SWF一个独立H5
+(`Egypt.html` 等)。忠实还原原Flash行为:
+- 页内动画 = 逐帧webp序列(25fps帧驱动, 字幕/按钮形态已印在帧里, 时序与原片一致)
+- 页尾停住 = 原SWF每页末的 stop()
+- 按钮 = 画面内热区(位置/大小从SWF放置矩阵提取), hover放大, 点击播原按钮音效
+  (DefineButtonSound Down态自动提取), 跳转关系来自 AS2 解析(on release→gotoAndStop)
+- 页旁白 = 每页一个mp3, 与帧动画同步起播(对应原SWF流式音轨按页切片)
 
 音频按 SWF 帧位置精确对齐(间隙还原原 Flash 翻页停顿)。**默认转完一个文件立即删除其帧PNG等中间产物**——3000+ 文件批量时不会撑爆磁盘。
 

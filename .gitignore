@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# 转换中间产物(工具默认转完即删, 这里防手滑)
+swf2video_work/

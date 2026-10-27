@@ -67,14 +67,58 @@ def scan_timeline(raw: bytes):
             frame += 1
         elif code == 19:                   # SoundStreamBlock
             pending = raw[pos:pos+length]
-        elif code == 43:                   # FrameLabel
-            labels[frame] = raw[pos+2:pos+length].split(b'\x00')[0].decode('utf8', 'replace')
+        elif code == 43:                   # FrameLabel: STRING name + \0 + namedAnchor
+            labels[frame] = raw[pos:pos+length].split(b'\x00')[0].decode('utf8', 'replace')
         elif code == 12:                   # DoAction —— 只找 stop()
             # ActionStop = 0x07 + End = 0x00 -> 字节签名 0700
             if raw[pos:pos+length].startswith(b'\x07\x00'):
                 stops.append(frame)
         pos += length
     return dict(fps=fps, frames=total, audio=audio, stops=stops, labels=labels)
+
+
+def scan_buttons(swf: Path) -> dict:
+    """导出 AS 并解析按钮跳转映射: {buttonId: 'P2'} (on release → gotoAndStop)"""
+    work = Path('swf2video_work/_btn')
+    work.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(['java', '-jar', str(FFDEC), '-export', 'script',
+                        work.resolve(), swf.name], cwd=swf.parent, capture_output=True)
+    mapping = {}
+    if r.returncode == 0:
+        for f in work.rglob('*.as'):
+            src = f.read_text(errors='replace')
+            if 'gotoAndStop' not in src:
+                continue
+            m_bid = re.search(r'DefineButton2_(\d+)', str(f))
+            m_tgt = re.search(r'gotoAndStop\("(\w+)"\)', src)
+            if m_bid and m_tgt:
+                mapping[m_bid.group(1)] = m_tgt.group(1)
+    return mapping
+
+
+def button_hotspots(swf: Path, swf_xml: Path) -> list:
+    """按钮画面内热区: 按钮元件bounds × 放置矩阵 → 世界矩形(px)。
+    与 swf2card 的热区逻辑同源。返回 [{cid, x, y, w, h}]"""
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from swf2card import SwfModel, matrix_from_xml, transform_bbox
+        model = SwfModel(swf_xml)
+        out = []
+        for el in model.tags:
+            cid = int(el.get('characterId') or 0)
+            if not ((el.get('type') or '').startswith('PlaceObject') and cid in model.buttons):
+                continue
+            M = matrix_from_xml(el)
+            bb = model.union_bounds(cid)
+            if not bb:
+                continue
+            w = transform_bbox(M, bb)
+            out.append(dict(cid=cid, x=w[0]/20, y=w[2]/20,
+                            w=(w[1]-w[0])/20, h=(w[3]-w[2])/20))
+        return out
+    except Exception as e:
+        print(f"  热区提取失败({e}) — 按钮退化为文字按钮")
+        return []
 
 
 def detect_pages(tl) -> list:
@@ -184,66 +228,98 @@ def _cleanup(workdir: Path, stem: str):
 
 # ---------- 播放页 ----------
 
-INDEX_TMPL = """<!DOCTYPE html>
+ANIM_TMPL = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Flash 课件 H5 版</title>
+<title>__TITLE__</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:"PingFang SC","Microsoft YaHei",sans-serif;
          background:linear-gradient(180deg,#aee3ff,#e8f7ff 60%,#cdeffd);
-         display:flex; flex-direction:column; align-items:center; min-height:100%; }
-  .tabs { display:flex; gap:10px; padding:12px; flex-wrap:wrap; justify-content:center; }
-  .tab { padding:8px 22px; border-radius:20px; border:2px solid #fff;
-          background:rgba(255,255,255,.65); color:#2a6fa8; font-size:16px; cursor:pointer; }
-  .tab.active { background:#ff9a3c; color:#fff; }
-  .stage { width:min(92vw,720px); background:#fff; border-radius:14px; overflow:hidden;
-            box-shadow:0 6px 24px rgba(60,120,180,.25); }
-  video { display:block; width:100%; }
-  .bar { display:flex; align-items:center; justify-content:center; gap:14px; padding:14px 0 4px; }
-  .nav { width:46px; height:46px; border-radius:50%; border:none; cursor:pointer;
-          background:#2a86c8; color:#fff; font-size:22px; }
-  .nav:disabled { background:#b9d4e6; }
-  .dots { display:flex; gap:10px; }
-  .dot { width:14px; height:14px; border-radius:50%; background:#c3dcec; cursor:pointer; }
-  .dot.active { background:#ff9a3c; transform:scale(1.25); }
-  .replay { padding-top:6px; }
-  .replay button { padding:8px 20px; border-radius:18px; border:2px solid #ffd9b0;
-                    background:#fff7ef; color:#d97a1f; font-size:15px; cursor:pointer; }
-  .hint { color:#6a97b5; font-size:13px; padding:8px 0 18px; }
+         display:flex; flex-direction:column; align-items:center; justify-content:center;
+         min-height:100vh; }
+  .stage { position:relative; width:min(96vw,__W__px); user-select:none; overflow:hidden;
+            border-radius:8px; box-shadow:0 6px 24px rgba(60,120,180,.25); }
+  .stage img.frame { display:block; width:100%; }
+  /* 画面内按钮热区: 位置/大小来自SWF放置矩阵, 按钮 Up 态已印在帧里 */
+  .hotspot { position:absolute; cursor:pointer; z-index:2;
+              transition:transform .15s ease; }
+  .hotspot:hover { transform:scale(1.12); filter:drop-shadow(0 0 6px rgba(255,180,60,.9)); }
+  .hotspot:active { transform:scale(.96); }
 </style>
 </head>
 <body>
-<div class="tabs" id="tabs"></div>
-<div class="stage"><video id="player" playsinline preload="auto"></video></div>
-<div class="bar">
-  <button class="nav" id="prev">‹</button>
-  <div class="dots" id="dots"></div>
-  <button class="nav" id="next">›</button>
+<div class="stage" id="stage">
+  <img class="frame" id="frame" src="__FIRST_FRAME__" alt="">
 </div>
-<div class="replay"><button onclick="p.currentTime=0;p.play()">↻ 重播本页</button></div>
-<div class="hint">每页播完后点 › 下一页（与原 Flash 翻页一致）</div>
 <script>
-const COURSES = __COURSES__;
-let course = Object.keys(COURSES)[0], page = 1;
-const p = document.getElementById('player');
-function load() {
-  p.src = `videos/${course}_p${page}.mp4`;
-  const n = COURSES[course];
-  document.getElementById('dots').innerHTML =
-    Array.from({length:n}, (_,i) =>
-      `<span class="dot" onclick="page=${i+1};load()" style="${i+1===page?'background:#ff9a3c;transform:scale(1.25)':''}"></span>`).join('');
-  document.getElementById('prev').disabled = page === 1;
-  document.getElementById('next').disabled = page === n;
+// ===== 忠实还原原SWF: 页内帧动画(25fps帧驱动, 字幕含在帧中) + 按钮(热区/跳转/音效) =====
+const PAGES = __PAGES__;      // [{frames:[帧文件名], audio:'p1.mp3', dur:秒}]
+const HOTSPOTS = __HOTSPOTS__; // [{x,y,w,h(px,舞台系), seg:目标页}]
+const FPS = __FPS__;
+const W = __W__, H = __H__;
+let page = 1, frameIdx = 0, playing = false, raf = 0, audio = null, t0 = 0;
+const img = document.getElementById('frame');
+const stage = document.getElementById('stage');
+const clickSnd = new Audio('click.mp3');
+function playClick(){ clickSnd.currentTime = 0; clickSnd.play().catch(()=>{}); }
+
+function renderHotspots() {
+  stage.querySelectorAll('.hotspot').forEach(e => e.remove());
+  HOTSPOTS.forEach(h => {
+    const d = document.createElement('div');
+    d.className = 'hotspot';
+    d.style.left = (h.x / W * 100) + '%';
+    d.style.top = (h.y / H * 100) + '%';
+    d.style.width = (h.w / W * 100) + '%';
+    d.style.height = (h.h / H * 100) + '%';
+    d.onclick = () => goto(h.seg);
+    stage.appendChild(d);
+  });
 }
-document.getElementById('prev').onclick = () => { if (page>1) {page--;load();} };
-document.getElementById('next').onclick = () => { if (page<COURSES[course]) {page++;load();} };
-document.getElementById('tabs').innerHTML = Object.entries(COURSES).map(([k,v],i) =>
-  `<button class="tab" onclick="course='${k}';page=1;document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));this.classList.add('active');load()">${v.title}</button>`).join('');
-document.querySelector('.tab').classList.add('active');
-load();
+function tick(now) {
+  if (!playing) return;
+  const el = (now - t0) / 1000 * FPS;
+  const n = PAGES[page-1].frames.length;
+  frameIdx = Math.min(n - 1, Math.floor(el));
+  img.src = PAGES[page-1].frames[frameIdx];
+  if (frameIdx >= n - 1) {          // 页尾停住 = 原SWF的 stop()
+    playing = false;
+    if (audio) audio.pause();
+    return;
+  }
+  raf = requestAnimationFrame(tick);
+}
+function playPage(seg) {
+  page = seg; frameIdx = 0;
+  const pd = PAGES[page-1];
+  img.src = pd.frames[0];
+  if (audio) { audio.pause(); audio = null; }
+  if (pd.audio) {
+    audio = new Audio(pd.audio);
+    audio.play().catch(()=>{});
+  }
+  playing = true;
+  t0 = performance.now();
+  cancelAnimationFrame(raf);
+  raf = requestAnimationFrame(tick);
+}
+function goto(seg) {
+  if (seg < 1 || seg > PAGES.length) return;
+  playClick();
+  playPage(seg);
+}
+// 预加载: 首页帧立即载, 其余页帧后台预热(点按钮零等待)
+const preloadPool = {};
+PAGES.forEach((pd, i) => pd.frames.forEach(f => {
+  if (i === 0) { const im = new Image(); im.src = f; }
+  else { preloadPool[f] = () => { const im = new Image(); im.src = f; delete preloadPool[f]; }; }
+}));
+setTimeout(() => Object.values(preloadPool).forEach(fn => fn()), 3000);
+renderHotspots();
+playPage(1);   // 打开即播第1页(与原SWF一致)
 </script>
 </body>
 </html>
@@ -251,6 +327,46 @@ load();
 
 
 # ---------- 主流程 ----------
+
+def export_click_sound(swf: Path, outdir: Path) -> str | None:
+    """提取按钮点击音效(DefineButtonSoundChar2=Down态 → DefineSound),
+    转码到输出目录 click.mp3。返回文件名或 None。忠实还原原 Flash
+    "点按钮有声"的行为(paged H5 翻页时播放)。"""
+    import xml.etree.ElementTree as ET
+    work = outdir / "_meta"
+    work.mkdir(parents=True, exist_ok=True)
+    xmlp = work / f"{swf.stem}.xml"
+    r = subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name, xmlp.resolve()],
+                       cwd=swf.parent, capture_output=True)
+    if r.returncode != 0:
+        return None
+    root = ET.parse(xmlp).getroot()
+    ids = set()
+    for it in root.iter('item'):
+        if (it.get('type') or '') == 'DefineButtonSoundTag':
+            cid = it.get('buttonSoundChar2')   # Char2 = Down 态(按下发声)
+            if cid and cid != '0':
+                ids.add(int(cid))
+    if not ids:
+        return None
+    # 导出这些 DefineSound
+    id_arg = ','.join(str(i) for i in sorted(ids))
+    snd_dir = work / "snd"
+    subprocess.run(['java', '-jar', str(FFDEC), '-selectid', id_arg,
+                    '-export', 'sound', snd_dir.resolve(), swf.name],
+                   cwd=swf.parent, capture_output=True)
+    # 取第一个成功的转成 mp3
+    for f in sorted(snd_dir.glob('*')):
+        out = outdir / "click.mp3"
+        r = subprocess.run(['ffmpeg', '-y', '-i', str(f), '-ar', '44100',
+                            '-c:a', 'libmp3lame', '-q:a', '4', str(out)],
+                           capture_output=True)
+        if r.returncode == 0:
+            shutil.rmtree(work, ignore_errors=True)
+            return "click.mp3"
+    shutil.rmtree(work, ignore_errors=True)
+    return None
+
 
 def convert(swf: Path, workdir: Path, outdir: Path, results: dict,
             full: bool = True, keep_work: bool = False):
@@ -261,8 +377,31 @@ def convert(swf: Path, workdir: Path, outdir: Path, results: dict,
     raw = decompress(swf)
     tl = scan_timeline(raw)
     pages = detect_pages(tl)
+    # 按钮跳转映射(忠实还原原Flash导航语义): {buttonId: 'P2'} → 第几页
+    btn_map = scan_buttons(swf) if not full else {}
+    # 按钮画面内热区(坐标来自SWF放置矩阵 — 按钮已印在视频帧里, 只需叠透明点击区)
+    hotspots = []
+    if btn_map and not full:
+        r2 = subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name,
+                             (workdir / 'hot.xml').resolve()], cwd=swf.parent, capture_output=True)
+        if r2.returncode == 0:
+            hotspots = button_hotspots(swf, workdir / 'hot.xml')
+        if hotspots:
+            print(f"  按钮热区: {len(hotspots)}个 {[(h['x'], h['y']) for h in hotspots]}")
+    # 页号 → 段索引: 标签P1在帧f → 页i = 含f的段
+    label_to_seg = {}
+    for lf, lname in tl['labels'].items():
+        m = re.fullmatch(r'P(\d+)', lname, re.I)
+        if m:
+            for i, (f0, f1) in enumerate(pages, 1):
+                if f0 <= lf <= f1:
+                    label_to_seg[lname.upper()] = i
+                    break
     print(f"  时间轴: {tl['frames']}帧 @{tl['fps']:.0f}fps, 页边界: {pages}(整条模式不切片), "
           f"stop帧: {tl['stops']}, 标签: {tl['labels']}")
+    if btn_map:
+        nav = {b: label_to_seg.get(t) for b, t in btn_map.items()}
+        print(f"  按钮导航: {btn_map} → 段 {nav}")
 
     frames_dir = workdir / f"frames_{stem}"
     export_frames(swf, frames_dir)
@@ -348,10 +487,118 @@ def convert(swf: Path, workdir: Path, outdir: Path, results: dict,
                        seg_outdir / f"{stem}_p{i}.mp4", tl['fps'])
         print(f"  p{i}: 帧{f0}-{f1} ({nf}帧={dur:.2f}s) 音频{'✓' if seg_audio else '静音'}")
 
-    results[stem] = dict(title=name, pages=n_pages)
+    results[stem] = dict(title=name, pages=n_pages,
+                         nav={b: label_to_seg.get(t) for b, t in btn_map.items()},
+                         hotspots=[{k: round(v, 1) for k, v in h.items()} for h in hotspots])
     if not keep_work:
         _cleanup(workdir, stem)
     return n_pages
+
+
+def convert_animated(swf: Path, workdir: Path, outdir: Path, keep_work: bool = False):
+    """忠实还原产物形态: 一个SWF → 一个独立H5动画页。
+    页内动画 = 逐帧PNG序列 + JS帧驱动(字幕/按钮Up态已印在帧里);
+    旁白 = 每页一个mp3, 与帧同步播放; 按钮 = 画面内热区(hover放大,
+    点击播原按钮音效); 页尾停住 = 原SWF的 stop()。"""
+    import shutil
+    name = swf.stem
+    stem = re.sub(r'[^\w\-]', '_', name)
+    print(f"\n== {name} (动画页模式) ==")
+    raw = decompress(swf)
+    tl = scan_timeline(raw)
+    pages = detect_pages(tl)
+    btn_map = scan_buttons(swf)
+    # 页号→段索引
+    label_to_seg = {}
+    for lf, lname in tl['labels'].items():
+        m = re.fullmatch(r'P(\d+)', lname, re.I)
+        if m:
+            for i, (f0, f1) in enumerate(pages, 1):
+                if f0 <= lf <= f1:
+                    label_to_seg[lname.upper()] = i
+                    break
+    print(f"  时间轴: {tl['frames']}帧 @{tl['fps']:.0f}fps, 页: {pages}, 按钮: {btn_map}")
+
+    # 帧序列(整条导出一次)
+    frames_dir = workdir / f"frames_{stem}"
+    n_exported = export_frames(swf, frames_dir)
+    track = export_audio(swf, workdir / f"audio_{stem}")
+    # 舞台尺寸: 从第1帧PNG读
+    from PIL import Image
+    first_png = frames_dir / '1.png'
+    W, H = Image.open(first_png).size
+
+    # 输出结构: outdir/<stem>/frames/*.jpg + p*.mp3 + <stem>.html + click.mp3
+    out = outdir / stem
+    out.mkdir(parents=True, exist_ok=True)
+    fr_out = out / 'frames'
+    fr_out.mkdir(exist_ok=True)
+
+    page_defs = []
+    for i, (f0, f1) in enumerate(pages, 1):
+        # 帧转webp q80(比同质量jpg小40%, 字幕/木牌文字细节验证无损)
+        names = []
+        for f in range(f0, f1 + 1):
+            src = frames_dir / f'{f}.png'
+            if not src.exists():
+                continue
+            dst = fr_out / f'p{i}_{f - f0 + 1:03d}.webp'
+            subprocess.run(['ffmpeg', '-y', '-i', str(src), '-quality', '80', str(dst)],
+                           capture_output=True)
+            names.append(f'frames/{dst.name}')
+        # 页旁白
+        aud_name = None
+        has_sound = any(f0 <= f <= f1 for f in tl['audio'])
+        if track and has_sound:
+            seg = out / f'p{i}.mp3'
+            slice_audio(track, (f0 - 1) / tl['fps'], (f1 - f0 + 1) / tl['fps'], seg)
+            aud_name = seg.name
+        page_defs.append(dict(frames=names, audio=aud_name,
+                              dur=round((f1 - f0 + 1) / tl['fps'], 2)))
+        print(f"  p{i}: {len(names)}帧 {(f1-f0+1)/tl['fps']:.2f}s 音频{'✓' if aud_name else '无'}")
+
+    # 按钮热区 + 跳转
+    hotspots = []
+    r2 = subprocess.run(['java', '-jar', str(FFDEC), '-swf2xml', swf.name,
+                         (workdir / 'hot.xml').resolve()], cwd=swf.parent, capture_output=True)
+    if r2.returncode == 0:
+        sys.path.insert(0, str(Path(__file__).parent))
+        try:
+            from swf2card import SwfModel, matrix_from_xml, transform_bbox
+            model = SwfModel(workdir / 'hot.xml')
+            for el in model.tags:
+                cid = int(el.get('characterId') or 0)
+                if not ((el.get('type') or '').startswith('PlaceObject') and cid in model.buttons):
+                    continue
+                M = matrix_from_xml(el)
+                bb = model.union_bounds(cid)
+                if not bb:
+                    continue
+                w = transform_bbox(M, bb)
+                seg = label_to_seg.get(btn_map.get(str(cid), ''), None)
+                hotspots.append(dict(x=round(w[0]/20, 1), y=round(w[2]/20, 1),
+                                     w=round((w[1]-w[0])/20, 1), h=round((w[3]-w[2])/20, 1),
+                                     seg=seg))
+            print(f"  热区: {[(h['x'], h['y'], h['seg']) for h in hotspots]}")
+        except Exception as e:
+            print(f"  热区提取失败({e})")
+
+    # 按钮点击音效
+    click_snd = export_click_sound(swf, out)
+
+    html = (ANIM_TMPL
+            .replace('__TITLE__', f'{name}')
+            .replace('__W__', str(W))
+            .replace('__H__', str(H))
+            .replace('__FPS__', str(tl['fps']))
+            .replace('__FIRST_FRAME__', page_defs[0]['frames'][0] if page_defs and page_defs[0]['frames'] else '')
+            .replace('__PAGES__', json.dumps(page_defs, ensure_ascii=False))
+            .replace('__HOTSPOTS__', json.dumps(hotspots, ensure_ascii=False)))
+    (out / f'{stem}.html').write_text(html, encoding='utf8')
+    print(f"  ✓ 输出: {out}/{stem}.html ({len(page_defs)}页)")
+    if not keep_work:
+        _cleanup(workdir, stem)
+    return len(page_defs)
 
 
 def main():
@@ -361,27 +608,53 @@ def main():
                     help='输出目录 (默认 ./h5video)')
     ap.add_argument('--paged', action='store_true',
                     help='按 Flash 翻页结构拆成多段(默认整条连播一条到底)')
+    ap.add_argument('--anim', action='store_true',
+                    help='忠实动画页模式: 每SWF一个独立H5(帧驱动动画+画面按钮热区+旁白)')
     ap.add_argument('--keep-work', action='store_true',
                     help='保留中间产物(帧PNG等,调试用;默认转完即删,防止批量时磁盘爆满)')
     ap.add_argument('-w', '--work', type=Path, default=Path('swf2video_work'),
                     help='中间产物目录 (默认 ./swf2video_work)')
     args = ap.parse_args()
 
+    if args.anim:
+        for swf in args.swfs:
+            if not swf.exists():
+                print(f"跳过(不存在): {swf}"); continue
+            try:
+                convert_animated(swf, args.work.resolve(), args.out.resolve(),
+                                 keep_work=args.keep_work)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"✗ {swf}: {e}")
+                if not args.keep_work:
+                    _cleanup(args.work.resolve(), re.sub(r'[^\w\-]', '_', swf.stem))
+        return
+
     results = {}
+    click_snd = None
     for swf in args.swfs:
         if not swf.exists():
             print(f"跳过(不存在): {swf}"); continue
         try:
-            convert(swf, args.work.resolve(), args.out.resolve(), results,
-                    full=not args.paged, keep_work=args.keep_work)
+            n = convert(swf, args.work.resolve(), args.out.resolve(), results,
+                        full=not args.paged, keep_work=args.keep_work)
+            # paged 模式: 提取按钮点击音效(忠实还原原Flash"点按钮有声")
+            if args.paged and n and click_snd is None:
+                click_snd = export_click_sound(swf, args.out.resolve())
+                if click_snd:
+                    print(f"  点击音效: {click_snd}")
         except Exception as e:
             print(f"✗ {swf}: {e}")
             if not args.keep_work:
                 _cleanup(args.work.resolve(), re.sub(r'[^\w\-]', '_', swf.stem))
 
     if results:
+        snd_js = ("const CLICK = 'click.mp3';\nconst clickSnd = new Audio(CLICK);\n"
+                  "function playClick(){ clickSnd.currentTime=0; clickSnd.play().catch(()=>{}); }\n"
+                  if click_snd else "function playClick(){}\n")
         (args.out / 'index.html').write_text(
-            INDEX_TMPL.replace('__COURSES__', json.dumps(results, ensure_ascii=False)),
+            INDEX_TMPL.replace('__COURSES__', json.dumps(results, ensure_ascii=False))
+                      .replace('__CLICK_SOUND__', snd_js),
             encoding='utf8')
         print(f"\n✓ 完成 {len(results)} 个课件 -> {args.out}/index.html")
 
