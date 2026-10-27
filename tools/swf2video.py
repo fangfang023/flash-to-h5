@@ -202,15 +202,16 @@ def slice_audio(track: Path, t0: float, dur: float, out: Path):
 
 def build_page_audio(tl: dict, pages: list, workdir: Path, stem: str,
                      outdir: Path, SR: int = 44100) -> list:
-    """按 SWF 流音块的时间轴位置重建每页音频(切片正确性修复)。
+    """按 SWF 流音块的时间轴位置重建每页音频。
 
-    教训: mp3 文件的解码时长 ≠ SWF 时间轴窗口(mp3帧与SWF帧边界不对齐,
-    teacher: 块窗口 0~27.4s, mp3 文件却 23.3s)。按文件时长切片会错位、丢段
-    (P4"例句"讲解音丢失的根因)。正确算法 = 整条模式的 canvas 铺 PCM:
-      1. 各块的 MP3 数据顺序拼接解码(块[4字节头]已由JPEXS的-1.mp3处理)
-      2. 但拼接 mp3 的时长要按"块窗口"映射回 SWF 时间轴, 不能按文件时长
-    实现: 解码整条轨为 PCM → 按 (块起始帧时间戳 / 块窗口总时长) 的线性映射
-    重铺到整条时间轴 canvas → 按页窗口切 PCM → 编码 mp3。
+    教训1(例句无声): mp3 文件的解码时长 ≠ SWF 帧窗口, 按文件时长切片错位。
+    教训2(字幕错位): 块帧不连续(页尾有静音帧区间), 把所有块的PCM按比例
+      线性映射到整个块窗口会**吞掉静音区间**, 音频累计落后画面约4秒。
+    正确算法:
+      1. 找连续块段(帧连续) — 段与段之间是页尾静音区
+      2. 每段: 块payload剥头拼接 → 解码PCM → 铺到canvas的该段帧区间
+         (段内块密度=1块/帧, PCM时长≈帧窗口, 直接连续铺即可)
+      3. 按页窗口切 canvas → mp3
     返回 [每页音频路径或None]。
     """
     import io as _io, wave as _wave
@@ -219,65 +220,59 @@ def build_page_audio(tl: dict, pages: list, workdir: Path, stem: str,
     frames_sorted = sorted(total_audio)
     if not frames_sorted:
         return [None] * len(pages)
-    # 块窗口: 首块帧到末块帧+1 的时间范围
-    w_start = (frames_sorted[0] - 1) / fps
-    w_end = (frames_sorted[-1] + 1) / fps
-    w_dur = w_end - w_start
-    # 解码整条轨(JPEXS -1.mp3)
     track = export_audio_from_blocks(tl, workdir, stem)
     if track is None:
         return [None] * len(pages)
-    wavf = workdir / f'{stem}_full_pcm.wav'
-    subprocess.run(['ffmpeg', '-y', '-i', str(track), '-ar', str(SR), '-ac', '2',
-                    '-c:a', 'pcm_s16le', str(wavf)], capture_output=True)
-    w = _wave.open(str(wavf))
-    pcm = w.readframes(w.getnframes())
-    w.close()
-    n_samples = len(pcm) // 4   # stereo 16bit
-    file_dur = n_samples / SR
-    # 线性映射: SWF时间 ∈ [w_start, w_end] → PCM时间 ∈ [0, file_dur]
-    def swf_to_pcm(t_swf):
-        if t_swf <= w_start:
-            return 0.0
-        if t_swf >= w_end:
-            return file_dur
-        return (t_swf - w_start) / w_dur * file_dur
-    # 整条时间轴 canvas(每帧窗口铺对应的PCM段)
-    total_frames = tl['frames']
-    canvas_dur = total_frames / fps
+    # 整条时间轴 canvas
+    canvas_dur = tl['frames'] / fps
     canvas = bytearray(int(canvas_dur * SR) * 4)
-    for i, f in enumerate(frames_sorted):
-        seg_t0 = swf_to_pcm((f - 1) / fps)
-        seg_t1 = swf_to_pcm(min(f / fps, w_end))
-        if seg_t1 <= seg_t0:
+    # 连续块段
+    segments = []
+    seg_start = frames_sorted[0]
+    prev = frames_sorted[0]
+    for f in frames_sorted[1:] + [10**9]:
+        if f - prev > 1:
+            segments.append((seg_start, prev))
+            seg_start = f
+        prev = f
+    # 每段独立解码并铺到对应帧区间
+    for s0, s1 in segments:
+        stream = b''.join((total_audio[f][4:] if len(total_audio[f]) > 8 else total_audio[f])
+                          for f in range(s0, s1 + 1) if f in total_audio)
+        bf = workdir / f'{stem}_seg.mp3'
+        bf.write_bytes(stream)
+        wavf = workdir / f'{stem}_seg.wav'
+        r = subprocess.run(['ffmpeg', '-y', '-i', str(bf), '-ar', str(SR), '-ac', '2',
+                            '-c:a', 'pcm_s16le', str(wavf)], capture_output=True)
+        bf.unlink(missing_ok=True)
+        if r.returncode != 0:
+            wavf.unlink(missing_ok=True)
             continue
-        s0 = int(seg_t0 * SR) * 4
-        s1 = min(int(seg_t1 * SR) * 4, len(pcm))
-        if s1 <= s0:
-            continue
-        d_pos = int(((f - 1) / fps) * SR) * 4
-        d_end = min(d_pos + (s1 - s0), len(canvas))
-        canvas[d_pos:d_end] = pcm[s0:s1]
+        w = _wave.open(str(wavf))
+        data = w.readframes(w.getnframes())
+        w.close()
+        wavf.unlink(missing_ok=True)
+        pos = int(((s0 - 1) / fps) * SR) * 4
+        end = min(pos + len(data), len(canvas))
+        canvas[pos:end] = data[:end - pos]
     # 按页切 canvas → mp3
     out_paths = []
     for i, (f0, f1) in enumerate(pages, 1):
-        p0 = int(((f0 - 1) / fps) * SR) * 4
-        p1 = min(int((f1 / fps) * SR) * 4, len(canvas))
-        seg = bytes(canvas[p0:p1])
         if not any(f0 <= f <= f1 for f in frames_sorted):
             out_paths.append(None)
             continue
+        p0 = int(((f0 - 1) / fps) * SR) * 4
+        p1 = min(int((f1 / fps) * SR) * 4, len(canvas))
         wav_seg = workdir / f'{stem}_p{i}.wav'
         w2 = _wave.open(str(wav_seg), 'wb')
         w2.setnchannels(2); w2.setsampwidth(2); w2.setframerate(SR)
-        w2.writeframes(seg)
+        w2.writeframes(bytes(canvas[p0:p1]))
         w2.close()
         mp3 = outdir / f'p{i}.mp3'
         subprocess.run(['ffmpeg', '-y', '-i', str(wav_seg), '-c:a', 'libmp3lame',
                         '-q:a', '0', str(mp3)], capture_output=True)
         wav_seg.unlink(missing_ok=True)
         out_paths.append(mp3 if mp3.exists() and mp3.stat().st_size > 1000 else None)
-    wavf.unlink(missing_ok=True)
     return out_paths
 
 
