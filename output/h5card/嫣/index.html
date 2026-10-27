@@ -10,13 +10,16 @@
          background:linear-gradient(180deg,#dff1ff,#f6fcff);
          min-height:100vh; display:flex; flex-direction:column;
          align-items:center; justify-content:center; }
-  .card { position:relative; width:min(96vw,720px); user-select:none; }
+  .card { position:relative; width:min(96vw,720px); user-select:none; overflow:hidden; }
   .card img.bg { display:block; width:100%; }
-  .panel { position:absolute; left:5.83%;top:0.35%;width:90.14%; pointer-events:none; }
-  .panel img { width:100%; display:block; }
-  .hot { position:absolute; cursor:pointer; border-radius:50%; transition:transform .12s, filter .12s; }
+  .anim { position:absolute; background-repeat:no-repeat; pointer-events:none;
+          z-index:1; animation: play linear infinite; }
+  .hot { position:absolute; cursor:pointer; z-index:2; border-radius:50%;
+         transition:transform .12s, filter .12s; }
   .hot:hover { transform:scale(1.07); filter:brightness(1.12); }
-  .hot.active { filter:brightness(1.2) drop-shadow(0 0 8px rgba(255,170,60,.9)); }
+  .panel { position:absolute; left:5.89%;top:0.49%;width:90.17%; pointer-events:none; }
+  .panel img { width:100%; display:block; }
+.hot.active { filter:brightness(1.2) drop-shadow(0 0 8px rgba(255,170,60,.9)); }
   .btnbar { display:flex; gap:10px; padding-bottom:10px; }
   .btnbar button { padding:8px 18px; border-radius:18px; border:2px solid #ffd9b0;
                    background:#fff7ef; color:#d97a1f; font-size:15px; cursor:pointer; }
@@ -26,13 +29,14 @@
 <body>
 <div class="card">
   <img class="bg" src="bg.png" alt="">
-  <div class="panel" id="panel"><img id="panelImg" src="" alt=""></div>
-  <div class="hot" data-panel="panel_pinyin.png" style="left:23.8%;top:24.6%;width:14%;height:13%" title="pinyin"></div>
-  <div class="hot" data-panel="panel_bushou.png" style="left:73.4%;top:26.5%;width:14%;height:13%" title="bushou"></div>
-  <div class="hot" data-panel="panel_jiegou.png" style="left:21.1%;top:50.2%;width:14%;height:13%" title="jiegou"></div>
-  <div class="hot" data-panel="panel_ziyi.png" style="left:73.8%;top:46.4%;width:14%;height:13%" title="ziyi"></div>
-  <div class="hot" data-panel="panel_cixing.png" style="left:12.6%;top:70.5%;width:14%;height:13%" title="cixing"></div>
-  <div class="hot" data-panel="panel_zuci.png" style="left:82.0%;top:69.7%;width:14%;height:13%" title="zuci"></div>
+  <div class="panel" id="panel" style="z-index:3"><img id="panelImg" src="" alt=""></div>
+  <div id="animLayer"></div>
+  <div class="hot" data-panel="panel_pinyin.png" style="left:20.1%;top:20.2%;width:7.0%;height:8.9%" title="pinyin"></div>
+  <div class="hot" data-panel="panel_bushou.png" style="left:69.8%;top:22.0%;width:7.0%;height:8.9%" title="bushou"></div>
+  <div class="hot" data-panel="panel_jiegou.png" style="left:14.5%;top:41.5%;width:13.1%;height:18.3%" title="jiegou"></div>
+  <div class="hot" data-panel="panel_ziyi.png" style="left:67.4%;top:38.6%;width:12.4%;height:15.5%" title="ziyi"></div>
+  <div class="hot" data-panel="panel_cixing.png" style="left:7.5%;top:66.3%;width:10.1%;height:7.8%" title="cixing"></div>
+  <div class="hot" data-panel="panel_zuci.png" style="left:74.3%;top:63.3%;width:15.6%;height:11.6%" title="zuci"></div>
 </div>
 <div class="btnbar">
   <button id="replay">↻ 重播讲解</button>
@@ -57,6 +61,33 @@ document.getElementById('reset').onclick = () => {
   panelImg.parentElement.style.display = 'none';
 };
 if (narr) narr.play().catch(() => {});
+// ===== 装饰动画层(自动生成) =====
+const ANIMS = [{"img": "anim_11_8ee6a12c.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 427.8, "y": 427.9, "w": 64.9, "h": 78.2, "flip": false}, {"img": "anim_13_7976b0bc.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 410.1, "y": 442.4, "w": 32.8, "h": 128.1, "flip": false}, {"img": "anim_15d54_6151b15c.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 340, "y": 451, "w": 93.9, "h": 59.8, "flip": false}, {"img": "anim_15d56_89256846.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 240, "y": 447, "w": 96.2, "h": 66.0, "flip": false}, {"img": "anim_11d58_a2f13412.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 164, "y": 442, "w": 77.3, "h": 86.5, "flip": false}, {"img": "anim_17d60_51a06e17.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 151, "y": 449, "w": 136.6, "h": 121.3, "flip": false}, {"img": "anim_15_f53d4cb0.png", "n": 120, "cols": 10, "rows": 12, "dur": 4.8, "x": 379.9, "y": 467.2, "w": 122.1, "h": 64.7, "flip": true}, {"img": "anim_30_b3c2378c.png", "n": 9, "cols": 9, "rows": 1, "dur": 0.36, "x": 355.9, "y": 380.8, "w": 76.3, "h": 72.8, "flip": false}];
+const layer = document.getElementById('animLayer');
+ANIMS.forEach(a => {
+  const d = document.createElement('div'); d.className = 'anim';
+  d.style.left = (a.x/720*100)+'%'; d.style.top = (a.y/576*100)+'%';
+  d.style.width = (a.w/720*100)+'%'; d.style.height = (a.h/576*100)+'%';
+  d.style.backgroundImage = `url(anim/${a.img})`;
+  if (a.flip) d.style.transform = 'scaleX(-1)';
+  const applySize = () => { const r = d.getBoundingClientRect();
+    if (r.width > 0) d.style.backgroundSize = `${r.width*a.cols}px ${r.height*a.rows}px`; };
+  applySize(); window.addEventListener('resize', applySize);
+  layer.appendChild(d);
+  let f = 0, last = performance.now();
+  const fd = a.dur*1000/a.n;
+  function tick(now){ if(now-last>=fd){
+    f=(f+Math.floor((now-last)/fd))%a.n; last=now;
+    const c=f%a.cols, r=Math.floor(f/a.cols);
+    const rr = d.getBoundingClientRect();
+    if (rr.width > 0) {
+      d.style.backgroundSize = `${rr.width*a.cols}px ${rr.height*a.rows}px`;
+      d.style.backgroundPosition = `${-c*rr.width}px ${-r*rr.height}px`;
+    }
+  } requestAnimationFrame(tick); }
+  requestAnimationFrame(tick);
+});
+document.querySelector('img.bg').src = 'bg_clean_e3d46398.png';
 const idx = ['pinyin','bushou','jiegou','ziyi','cixing','zuci'].indexOf(location.hash.slice(1));
 if (idx >= 0 && hots[idx]) hots[idx].click();
 </script>
